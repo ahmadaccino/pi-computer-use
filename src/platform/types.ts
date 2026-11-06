@@ -150,11 +150,13 @@ export interface PlatformObserveRequest {
 	includeImage?: boolean;
 }
 
-export type PlatformActTarget = { ref: string } | { x: number; y: number } | { focus: PlatformPoint };
+export type PlatformActTarget = { ref: string } | { x: number; y: number; space?: "screen" } | { focus: PlatformPoint } | { window: true };
 type PlatformDeliveryPolicy = "ax_only" | "background" | "default" | "foreground";
 type PlatformMouseButton = "left" | "right" | "middle";
 type PlatformActDeliveryParam = { delivery?: NativeInputDelivery };
 export type PlatformPoint = { x: number; y: number };
+/** Drag waypoint: acting-look pixels, pixels of another cached look (`lookId`), or global screen points (`space: "screen"`). */
+export type PlatformDragPoint = PlatformPoint & { lookId?: string; pid?: number; space?: "screen" };
 
 export interface PlatformActRequestBase {
 	lookId: string;
@@ -169,7 +171,7 @@ export type PlatformActRequest = PlatformActRequestBase & (
 	| { action: "typeText"; params: { text: string } & PlatformActDeliveryParam }
 	| { action: "keypress"; params: { keys: string[] } & PlatformActDeliveryParam }
 	| { action: "scroll"; params: { scrollX: number; scrollY: number } & PlatformActDeliveryParam }
-	| { action: "drag"; params: { path: PlatformPoint[] } & PlatformActDeliveryParam }
+	| { action: "drag"; params: { path: PlatformDragPoint[]; holdMs?: number; dwellMs?: number } & PlatformActDeliveryParam }
 	| { action: "moveMouse"; params: PlatformActDeliveryParam }
 );
 

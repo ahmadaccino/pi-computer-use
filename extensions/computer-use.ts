@@ -21,20 +21,44 @@ import { getComputerUseConfig, getLoadedComputerUseConfig, loadComputerUseConfig
 
 const stateId = Type.String({ description: "Required state id owning every @e ref used by this operation" });
 const point = { x: Type.Number(), y: Type.Number() };
+const space = Type.Optional(Type.Union([Type.Literal("image"), Type.Literal("screen")], { description: "x/y space: image (default) = pixels of this state's screenshot, origin at the root's top-left; screen = global display points" }));
+const visibleText = Type.String({ description: "Visible label or on-screen (OCR) text to target; must resolve to one spot", minLength: 1, maxLength: 256 });
 const mouseButton = Type.Optional(Type.Union([Type.Literal("left"), Type.Literal("right"), Type.Literal("middle")]));
-const clickByRef = Type.Object({ action: Type.Literal("click"), ref: Type.String(), button: mouseButton, clickCount: Type.Optional(Type.Number({ minimum: 1, maximum: 3 })) });
-const clickByPoint = Type.Object({ action: Type.Literal("click"), ...point, button: mouseButton, clickCount: Type.Optional(Type.Number({ minimum: 1, maximum: 3 })) });
+const clickCount = Type.Optional(Type.Number({ minimum: 1, maximum: 3 }));
+const clickByRef = Type.Object({ action: Type.Literal("click"), ref: Type.String(), button: mouseButton, clickCount });
+const clickByPoint = Type.Object({ action: Type.Literal("click"), ...point, space, button: mouseButton, clickCount });
+const clickByText = Type.Object({ action: Type.Literal("click"), text: visibleText, button: mouseButton, clickCount });
+const dragEndpoint = Type.Object({
+	ref: Type.Optional(Type.String({ description: "@e ref; owned by stateId when given, else by the act_ui state" })),
+	text: Type.Optional(visibleText),
+	stateId: Type.Optional(Type.String({ description: "State owning ref/text/x/y (x/y = that state's image pixels). Use another root's stateId to drop into a different window/app" })),
+	x: Type.Optional(Type.Number()),
+	y: Type.Optional(Type.Number()),
+	space,
+}, { description: "Exactly one of ref, text, or x+y" });
 const uiAction = Type.Union([
 	Type.Object({ action: Type.Literal("press"), ref: Type.String({ description: "Actionable outline ref" }) }),
 	clickByRef,
 	clickByPoint,
+	clickByText,
 	Type.Object({ action: Type.Literal("setText"), ref: Type.String({ description: "Editable outline ref" }), text: Type.String() }),
 	Type.Object({ action: Type.Literal("typeText"), ref: Type.Optional(Type.String({ description: "Omit after a click to type into the focus established by that click" })), text: Type.String() }),
 	Type.Object({ action: Type.Literal("keypress"), ref: Type.Optional(Type.String({ description: "Omit to send keys to the focused control" })), keys: Type.Array(Type.String(), { minItems: 1 }) }),
 	Type.Object({ action: Type.Literal("scroll"), ref: Type.Optional(Type.String()), scrollX: Type.Optional(Type.Number()), scrollY: Type.Optional(Type.Number()) }),
-	Type.Object({ action: Type.Literal("drag"), path: Type.Array(Type.Object(point), { minItems: 2 }) }),
-	Type.Object({ action: Type.Literal("moveMouse"), ...point }),
+	Type.Object({
+		action: Type.Literal("drag"),
+		from: Type.Optional(dragEndpoint),
+		to: Type.Optional(dragEndpoint),
+		path: Type.Optional(Type.Array(Type.Object(point), { minItems: 2, description: "Alternative to from/to: waypoints in `space`" })),
+		space,
+		holdMs: Type.Optional(Type.Number({ minimum: 0, maximum: 5000, description: "Press-and-hold before moving, default 250" })),
+		dwellMs: Type.Optional(Type.Number({ minimum: 0, maximum: 5000, description: "Hover over the drop target before release, default 400" })),
+	}),
+	Type.Object({ action: Type.Literal("moveMouse"), ...point, space }),
+	Type.Object({ action: Type.Literal("moveMouse"), text: visibleText }),
+	Type.Object({ action: Type.Literal("wait"), ms: Type.Number({ minimum: 0, maximum: 10000, description: "Pause inside the transaction, e.g. for a menu or loading state" }) }),
 ]);
+const successorObserve = Type.Optional(Type.Union([Type.Literal("semantic"), Type.Literal("visual"), Type.Literal("fused")], { description: "Successor observation; visual attaches the new screenshot so no follow-up observe_ui is needed" }));
 
 const conditionProperties = {
 	ref: Type.Optional(Type.String({ description: "Specific @e ref to test", maxLength: 128 })),
@@ -50,13 +74,15 @@ const findTool = defineTool({
 	name: "find_roots",
 	label: "Find Roots",
 	description: "Find a bounded, ranked set of controllable UI roots with refs, geometry, and focus state.",
-	promptSnippet: "Find a target root before observe_ui when needed.",
+	promptSnippet: "Find a target root before observe_ui when needed; launch:true opens an app and waits for its window.",
 	parameters: Type.Object({
 		text: Type.Optional(Type.String({ description: "Ranked app or title text", maxLength: 256 })),
 		app: Type.Optional(Type.String({ description: "Exact normalized app name", maxLength: 256 })),
 		bundleId: Type.Optional(Type.String({ description: "Exact bundle id" })),
 		pid: Type.Optional(Type.Integer({ minimum: 1, description: "Exact positive process id" })),
 		kind: Type.Optional(Type.Union([Type.Literal("window"), Type.Literal("menu"), Type.Literal("sheet"), Type.Literal("popover"), Type.Literal("dialog"), Type.Literal("browser_page")], { description: "Exact root kind" })),
+		launch: Type.Optional(Type.Boolean({ description: "Launch the app (app or bundleId) if it is not running, then wait for its window (macOS)" })),
+		waitMs: Type.Optional(Type.Number({ minimum: 0, maximum: 60000, description: "Poll until a matching root appears, up to this long (default 20000 with launch)" })),
 	}),
 	execute: executeFind,
 });
@@ -115,9 +141,15 @@ const actTool = defineTool({
 	name: "act_ui",
 	label: "Act",
 	description: "Perform one or more precisely targeted checked actions and return the successor state.",
-	promptSnippet: "Pass dependent click/type steps together and use expect for observable completion.",
-	promptGuidelines: ["After clicking an editable region, omit ref from typeText/keypress so input follows the established focus."],
-	parameters: Type.Object({ stateId, expect: Type.Optional(Type.Object(conditionProperties)), actions: Type.Array(uiAction, { minItems: 1, maxItems: 20 }) }),
+	promptSnippet: "Pass dependent click/type/wait steps together in one call, use expect for observable completion, and observe:\"visual\" to get the successor screenshot.",
+	promptGuidelines: [
+		"After clicking an editable region, omit ref from typeText/keypress so input follows the established focus.",
+		"Prefer one act_ui with several actions (insert {action:\"wait\",ms} for menus/loading) over many single-action calls.",
+		"Pass observe:\"visual\" when you will need to look at the result; do not run observe_ui in parallel with act_ui on the same root (it makes states stale).",
+		"Target custom-drawn/unlabeled controls with {action:\"click\",text:\"Label\"} (label or OCR text) or x/y in the state's image pixels; space:\"screen\" takes global screen points.",
+		"Drag between windows/apps in one action: act_ui on the source window's state with drag from:{ref|text} to:{ref|text, stateId:<other root's state>}.",
+	],
+	parameters: Type.Object({ stateId, expect: Type.Optional(Type.Object(conditionProperties)), observe: successorObserve, actions: Type.Array(uiAction, { minItems: 1, maxItems: 20 }) }),
 	execute: executeAct,
 });
 
@@ -135,7 +167,7 @@ const waitForTool = defineTool({
 	label: "Wait For",
 	description: "Wait for one scoped UI condition and return the successor state.",
 	promptSnippet: "Use after asynchronous UI changes instead of polling observe_ui.",
-	parameters: Type.Object({ ...conditionProperties, stateId }),
+	parameters: Type.Object({ ...conditionProperties, observe: successorObserve, stateId }),
 	execute: executeWaitFor,
 });
 

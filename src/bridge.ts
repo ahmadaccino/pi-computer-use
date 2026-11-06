@@ -6,19 +6,19 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { canRetryInForeground, outcomeAfterCheck, outcomeAfterObservedValues, prepareAction, type ActionState, type PreparedAction } from "./actions.ts";
+import { canRetryInForeground, outcomeAfterCheck, outcomeAfterObservedValues, prepareAction, type ActionEnvironment, type ActionState, type PreparedAction } from "./actions.ts";
 import { cdpClickForContext, cdpDragForContext, cdpEvaluateForContext, cdpKeypressForContext, cdpMouseForContext, cdpNavigateContext, cdpScrollForContext, cdpSnapshotForContext, cdpTabForWindow, cdpTypeFocusedForContext, cdpTypeForContext, disconnectCdp, listCdpPageContexts, type CdpConsoleEntry, type CdpPageSnapshot } from "./cdp.ts";
 import { getComputerUseConfig, isBrowserUseEnabled, isHeadlessMode, loadComputerUseConfig } from "./config.ts";
 import { normalizeFindParams } from "./find-params.ts";
 import { noteAfterAct, noteFromLook, noteRegionKeyForRef, renderNote, type WindowNote } from "./note.ts";
-import { controlLine, foldToBudget, graftScopedOutline, nodeByRef, outlineNodeLabel, outlineNodePath, rankedTextMatch, renderInteractiveControls, restoreOutline, searchOutline, searchOutlineRanked, serializeOutline, serializeOutlineNodeShallow, serializeOutlineSearchMatch, type LookResponse, type Outline, type OutlineChange, type OutlineDiff, type OutlineNode, type OutlineSearchMatch, type SerializedOutline, type SerializedOutlineNode, type SerializedOutlineSearchMatch } from "./outline.ts";
+import { controlLine, foldToBudget, graftScopedOutline, isInteractiveControl, nodeByRef, resolveTextTarget, outlineNodeLabel, outlineNodePath, rankedTextMatch, renderInteractiveControls, restoreOutline, searchOutline, searchOutlineRanked, serializeOutline, serializeOutlineNodeShallow, serializeOutlineSearchMatch, type LookResponse, type Outline, type OutlineChange, type OutlineDiff, type OutlineNode, type OutlineSearchMatch, type SerializedOutline, type SerializedOutlineNode, type SerializedOutlineSearchMatch } from "./outline.ts";
 import { applyOutputEnvelope, boundToolError, clearStoredOutputs, readStoredOutput, UI_TEXT_PAGE_CHARS } from "./output.ts";
-import { AGENT_TOOL_NAMES, type ActParams, type EvaluateBrowserParams, type ExpandUiParams, type ImageMode, type InspectUiParams, type LaunchBrowserParams, type FindParams, type NavigateBrowserParams, type ObserveDetail, type ObserveParams, type ObserveTargetParams, type ReadTextParams, type RootSelector, type SearchUiParams, type UiAction, type WaitForParams } from "./contract.ts";
+import { AGENT_TOOL_NAMES, type ActParams, type DragEndpoint, type SuccessorObserveMode, type EvaluateBrowserParams, type ExpandUiParams, type ImageMode, type InspectUiParams, type LaunchBrowserParams, type FindParams, type NavigateBrowserParams, type ObserveDetail, type ObserveParams, type ObserveTargetParams, type ReadTextParams, type RootSelector, type SearchUiParams, type UiAction, type WaitForParams } from "./contract.ts";
 import { toFiniteNumber } from "./platform/coerce.ts";
 import { currentPlatformBackend } from "./platform/index.ts";
 import type { FramePoints, HelperActPerformed, HelperActResult, NativeInputDelivery, PlatformActRequest, PlatformApp as HelperApp, PlatformDiagnostics, PlatformFrontmostResult as FrontmostResult, PlatformRoot as HelperWindow } from "./platform/types.ts";
 import type { PermissionStatus } from "./permissions.ts";
-import { ResourceScheduler } from "./runtime.ts";
+import { ResourceScheduler, StaleResourceStateError } from "./runtime.ts";
 import { scoreWindow, shouldPreferForegroundModalWindow } from "./root-selection.ts";
 import { SavedStates, type CurrentCapture, type CurrentTarget, type OperationState } from "./state.ts";
 import { changesBetween, renderChanges, stabilizeRefs } from "./view.ts";
@@ -300,7 +300,7 @@ const BROWSER_CONTEXT_PREFIX = "browser:";
 const MANAGED_BROWSER_READY_TIMEOUT_MS = 15_000;
 const AUTO_IMAGE_MAX_DIMENSION = 900;
 const EXPLICIT_IMAGE_MAX_DIMENSION = 1_600;
-const BROWSER_TRANSACTION_ACTIONS = new Set<UiAction["action"]>(["press", "click", "setText", "typeText", "keypress", "scroll", "drag", "moveMouse"]);
+const BROWSER_TRANSACTION_ACTIONS = new Set<UiAction["action"]>(["press", "click", "setText", "typeText", "keypress", "scroll", "drag", "moveMouse", "wait"]);
 
 const runtimeState: RuntimeState = {
 	lastPermissionCheckAt: 0,
@@ -312,7 +312,16 @@ const runtimeState: RuntimeState = {
 };
 
 const savedStates = new SavedStates();
-export const testing = { runInOperation: <T>(fn: () => T, state: OperationState = {}): T => savedStates.operations.run(state, fn), buildToolResult, browserObservationResult, waitForViewText, performSearchUi };
+export const testing = {
+	runInOperation: <T>(fn: () => T, state: OperationState = {}): T => savedStates.operations.run(state, fn),
+	buildToolResult,
+	browserObservationResult,
+	waitForViewText,
+	performSearchUi,
+	staleStateMessage: (error: StaleResourceStateError) => staleStateMessage(error),
+	rememberLatestState: (resourceKey: string, stateId: string, epoch: number) => latestStateByResource.set(resourceKey, { stateId, epoch }),
+	preflightUiTransaction: (actions: UiAction[], look: LookResponse, headless: boolean) => preflightUiTransaction(actions, look, headless),
+};
 let resourceScheduler = new ResourceScheduler();
 
 function operationState(): OperationState {
@@ -328,6 +337,18 @@ function persistOperation(state: OperationState): void {
 	const resourceKey = state.resourceKey ?? desktopResourceKey(state.currentTarget);
 	const epoch = state.epoch ?? resourceScheduler.epoch(resourceKey);
 	savedStates.saveDesktop(state, resourceKey, epoch);
+	latestStateByResource.set(resourceKey, { stateId: state.currentCapture.stateId, epoch });
+}
+
+/** Most recent saved state per physical resource; used to make stale-state errors directly recoverable. */
+const latestStateByResource = new Map<string, { stateId: string; epoch: number }>();
+
+function staleStateMessage(error: StaleResourceStateError): string {
+	const latest = latestStateByResource.get(error.resourceKey);
+	const retry = latest && latest.epoch === error.actualEpoch
+		? ` The latest state for this root is ${latest.stateId}; retry with that stateId (refs from older states may have been renumbered, so prefer refs/text/coordinates from it).`
+		: " Call observe_ui on the root again and retry with its stateId.";
+	return `${error.message} Another write to this root (often a parallel act_ui, or a failed act_ui) superseded the state you used.${retry} Avoid running act_ui and observe_ui for the same root in parallel — act_ui already returns the successor state (pass observe:"visual" to get its screenshot).`;
 }
 
 export async function setComputerUseActivity(active: boolean): Promise<void> {
@@ -537,6 +558,11 @@ function imageFallbackReason(
 	}
 	if (labeled * 3 < outline.nodes.length) {
 		return { reason: "unlabeled_ax_targets", message: "Most outline nodes are unlabeled, so the look image is attached for context." }
+	}
+	const interactive = outline.nodes.filter((node) => node !== outline.root && isInteractiveControl(node));
+	const unlabeledInteractive = interactive.filter((node) => !outlineNodeLabel(node)).length;
+	if (interactive.length >= 4 && unlabeledInteractive * 2 >= interactive.length) {
+		return { reason: "unlabeled_ax_targets", message: `${unlabeledInteractive} of ${interactive.length} controls are unlabeled (custom-drawn UI), so the look image is attached; target them by x/y or by visible text.` }
 	}
 	if (tool === "wait" && currentPlatformBackend.isBrowserApp(result.target.appName, result.target.bundleId)) {
 		return { reason: "browser_wait_verification", message: "Browser content may have changed visually during wait, so an image is attached for fallback." }
@@ -1112,7 +1138,7 @@ async function buildToolResult(
 	const outlineText = view
 		? `\n\n${view.text}`
 		: `\n\nChanges (${transition!.changedNodeCount}, ${base!.stateId} → ${result.capture.stateId}):\n${renderedChanges || "(no element changes)"}\nUse stateId ${result.capture.stateId} for subsequent actions and queries.`;
-	const fallbackText = fallbackReason ? `\n\n${fallbackReason.message}` : "";
+	const fallbackText = fallbackReason ? `\n\n${fallbackReason.message}${result.look.image ? `\n${coordinateLegend(result.look)}` : ""}` : "";
 	const deltaText = rootDeltaLines(execution).join("\n");
 	const content: AgentToolResult<ComputerUseDetails>["content"] = [{ type: "text", text: `${summary}${deltaText ? `\n${deltaText}` : ""}${consoleText}${noteText}${outlineText}${fallbackText}` }];
 	if (fallbackReason && result.look.image?.jpegBase64) {
@@ -1123,6 +1149,17 @@ async function buildToolResult(
 }
 
 type NativePreparedAction = Exclude<PreparedAction, { action: "wait" }>;
+
+function round2(value: number): string {
+	return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+/** One line telling the model exactly which space x/y use, so it never mixes image pixels with window/screen points. */
+function coordinateLegend(look: Pick<LookResponse, "image" | "window">): string {
+	const frame = look.window.framePoints;
+	const size = look.image ? `${look.image.width}×${look.image.height}` : "unavailable";
+	return `Coordinates: x/y are pixels of this ${size} image (origin = root top-left; element rects use the same space). The root occupies screen points (${round2(frame.x)},${round2(frame.y)}) ${round2(frame.w)}×${round2(frame.h)}; pass space:"screen" to give global screen points instead. Cross-window drags: drag.to {ref|text, stateId}.`;
+}
 
 function currentLookOrThrow(): LookResponse {
 	const state = operationState();
@@ -1245,7 +1282,7 @@ function helperActRequest(target: ResolvedTarget, action: NativePreparedAction, 
 			case "typeText": return { ...base, action: action.action, params: { text: action.params.text, delivery } };
 			case "keypress": return { ...base, action: action.action, params: { keys: action.params.keys, delivery } };
 			case "scroll": return { ...base, action: action.action, params: { scrollX: action.params.scrollX, scrollY: action.params.scrollY, delivery } };
-			case "drag": return { ...base, action: action.action, params: { path: action.params.path, delivery } };
+			case "drag": return { ...base, action: action.action, params: { path: action.params.path, holdMs: action.params.holdMs, dwellMs: action.params.dwellMs, delivery } };
 			case "moveMouse": return { ...base, action: action.action, params: { delivery } };
 		}
 	})();
@@ -1315,12 +1352,61 @@ async function windowDetailsForFind(query: FindParams, config: ReturnType<typeof
 	if (!query.app && !query.bundleId && !Number.isFinite(query.pid)) {
 		return collectBroadWindowDetails(await currentPlatformBackend.listRoots({}, signal), config);
 	}
-	const apps = (await listApps(signal)).filter((app) => appMatchesWindowQuery(app, query));
+	const allApps = await listApps(signal);
+	let apps = allApps.filter((app) => appMatchesWindowQuery(app, query));
+	if (apps.length === 0 && query.app) {
+		// Exact app names are brittle ("Engine DJ" vs "Engine DJ 4"); fall back to a
+		// strong (non-fuzzy) name match instead of reporting nothing.
+		apps = allApps.filter((app) => {
+			const match = rankedTextMatch([app.appName, app.bundleId ?? ""], query.app!);
+			return match && match.reason !== "fuzzy" && appMatchesWindowQuery(app, { ...query, app: undefined });
+		});
+	}
 	return await collectWindowDetails(apps, config, signal);
+}
+
+async function launchApp(query: FindParams, signal?: AbortSignal): Promise<string> {
+	if (process.platform !== "darwin") throw new Error("find_roots.launch is currently supported on macOS only; start the app another way and call find_roots with waitMs.");
+	const args = query.bundleId ? ["-b", query.bundleId] : ["-a", query.app!];
+	await new Promise<void>((resolve, reject) => {
+		const child = spawn("/usr/bin/open", args, { stdio: ["ignore", "ignore", "pipe"] });
+		let stderr = "";
+		child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+		child.on("error", reject);
+		child.on("close", (code) => code === 0 ? resolve() : reject(new Error(`Could not launch ${query.bundleId ?? query.app}: ${stderr.trim() || `open exited with ${code}`}`)));
+		signal?.addEventListener("abort", () => child.kill(), { once: true });
+	});
+	return query.bundleId ?? query.app!;
 }
 
 async function performListWindows(params: FindParams, signal?: AbortSignal): Promise<AgentToolResult<ListWindowsDetails>> {
 	const query = normalizeFindParams(params);
+	const deadline = Date.now() + (query.waitMs ?? (query.launch ? 20_000 : 0));
+	let launched: string | undefined;
+	let attempts = 0;
+	for (;;) {
+		attempts += 1;
+		const result = await listWindowsOnce(query, signal);
+		if ((result.details.returned ?? 0) > 0 || Date.now() >= deadline) {
+			if (launched) {
+				const first = result.content[0];
+				if (first?.type === "text") first.text = `Launched ${launched}. ${first.text}`;
+			}
+			if (attempts > 1 && !result.details.returned) {
+				const first = result.content[0];
+				if (first?.type === "text") first.text = `${first.text} (waited ${query.waitMs ?? 20_000}ms)`;
+			}
+			return result;
+		}
+		if (query.launch && !launched) {
+			const running = (await listApps(signal)).some((app) => appMatchesWindowQuery(app, { ...query, text: undefined, kind: undefined }));
+			if (!running) launched = await launchApp(query, signal);
+		}
+		await sleep(400, signal);
+	}
+}
+
+async function listWindowsOnce(query: FindParams, signal?: AbortSignal): Promise<AgentToolResult<ListWindowsDetails>> {
 	const config = getComputerUseConfig();
 	const desktopForest = await windowDetailsForFind(query, config, signal);
 	const includeBrowserPages = !query.pid && !query.bundleId && (!query.app || normalizeText(query.app) === "browser") && config.browser_use;
@@ -1593,7 +1679,9 @@ async function performWaitFor(params: WaitForParams, signal?: AbortSignal): Prom
 		timeoutMs,
 	}, { signal, timeoutMs: timeoutMs + 2_000 });
 	if (!state.resourceKey || state.epoch === undefined) throw new Error("The observation has no live resource identity. Observe again.");
-	const refreshed = (await resourceScheduler.readAt(state.resourceKey, state.epoch, async () => await captureCurrentTarget(signal, "auto"))).value;
+	const observe = successorObservation(params.observe);
+	state.currentImageMode = observe.imageMode;
+	const refreshed = (await resourceScheduler.readAt(state.resourceKey, state.epoch, async () => await captureCurrentTarget(signal, observe.readText, observe.maxDimension, undefined, observe.imageMode !== "never"))).value;
 	const transition = changesBetween(baseView.outline, refreshed.outline);
 	const useDiff = !transition.useFullView;
 	const matches = searchOutline(refreshed.outline, text, role, undefined, 1);
@@ -1617,7 +1705,9 @@ async function performWaitFor(params: WaitForParams, signal?: AbortSignal): Prom
 		renderedOutline: foldToBudget(refreshed.outline).text,
 	};
 	const message = details.found ? (details.gone ? "Condition disappeared." : "Condition appeared.") : `Timed out after ${timeoutMs}ms waiting for condition.`;
-	return { content: [{ type: "text", text: `${message}\n${waitForViewText(refreshed.outline, refreshed.capture.stateId, transition)}` }], details };
+	const content: AgentToolResult<WaitForDetails>["content"] = [{ type: "text", text: `${message}\n${waitForViewText(refreshed.outline, refreshed.capture.stateId, transition)}${observe.imageMode === "always" && refreshed.look.image ? `\n${coordinateLegend(refreshed.look)}` : ""}` }];
+	if (observe.imageMode === "always" && refreshed.look.image?.jpegBase64) content.push({ type: "image", data: refreshed.look.image.jpegBase64, mimeType: refreshed.look.image.mimeType ?? "image/jpeg" });
+	return { content, details };
 }
 
 function sameRootIdentity(a: CurrentTarget, b: CurrentTarget): boolean {
@@ -1791,14 +1881,84 @@ async function performInspectUi(params: InspectUiParams): Promise<AgentToolResul
 	return { content: [{ type: "text", text: fields.join("\n") }], details };
 }
 
-function prepareUiAction(action: UiAction, state: ActionState, look: LookResponse, headless: boolean): PreparedAction {
-	return prepareAction(action, state, {
+function formatTextCandidates(outline: Outline, candidates: ReturnType<typeof resolveTextTarget> & { kind: "ambiguous" }): string {
+	return candidates.candidates.slice(0, 6).map((candidate) => `${candidate.node.ref} ${candidate.node.role} ${JSON.stringify(outlineNodeLabel(candidate.node) || candidate.node.text[0]?.string || "")} at (${Math.round(candidate.point.x)},${Math.round(candidate.point.y)})${candidate.source === "ocr" ? " [ocr]" : ""}`).join("; ");
+}
+
+function resolveTextInOutline(outline: Outline, look: Pick<LookResponse, "readText">, text: string, label: string) {
+	const resolution = resolveTextTarget(outline, text);
+	if (resolution.kind === "ok") return resolution.candidate;
+	if (resolution.kind === "ambiguous") {
+		throw new Error(`${label} ${JSON.stringify(text)} matches ${resolution.candidates.length} distinct targets: ${formatTextCandidates(outline, resolution)}. Use one of these refs or coordinates, or a more specific text.`);
+	}
+	const ocrHint = look.readText?.executed ? "" : ' Visual text (OCR) was not read for this state; observe_ui with mode "visual" (or act_ui observe:"visual") reads it.';
+	throw new Error(`${label} ${JSON.stringify(text)} matched no visible label or text in this state.${ocrHint} Use search_ui for fuzzy matches.`);
+}
+
+/** Resolves a ref/text endpoint in another cached state; native grounding maps it through that state's look. */
+function foreignDragEndpoint(endpoint: DragEndpoint, label: string): { x: number; y: number; lookId: string; pid: number } {
+	const stateId = endpoint.stateId!.trim();
+	const record = savedStates.get(stateId);
+	if (!record) throw new Error(`${label}.stateId '${stateId}' is unavailable or was evicted. Observe that root again.`);
+	if (record.value.kind !== "desktop") throw new Error(`${label}.stateId '${stateId}' is a browser state; cross-window drags need desktop states.`);
+	const outline = restoreOutline(record.value.outline);
+	const look = record.value.look;
+	let point: { x: number; y: number };
+	if (Number.isFinite(endpoint.x) && Number.isFinite(endpoint.y)) {
+		if (endpoint.space === "screen") throw new Error(`${label}: space "screen" points are global; omit stateId.`);
+		const width = look.image?.width ?? look.window.framePoints.w;
+		const height = look.image?.height ?? look.window.framePoints.h;
+		if (endpoint.x! < 0 || endpoint.y! < 0 || endpoint.x! >= width || endpoint.y! >= height) throw new Error(`${label} (${Math.round(endpoint.x!)},${Math.round(endpoint.y!)}) is outside state ${stateId}'s image (${width}x${height}).`);
+		point = { x: endpoint.x!, y: endpoint.y! };
+	} else if (endpoint.ref?.trim()) {
+		const node = nodeByRef(outline, endpoint.ref.trim());
+		if (!node) throw new Error(`${label}.ref '${endpoint.ref}' is not available in state ${stateId}.`);
+		point = outlineNodeCenter(node);
+	} else {
+		const candidate = resolveTextInOutline(outline, look, endpoint.text!.trim(), label);
+		point = candidate.point;
+	}
+	return { x: point.x, y: point.y, lookId: look.lookId, pid: record.value.target.pid };
+}
+
+function actionEnvironment(look: LookResponse, headless: boolean): ActionEnvironment {
+	return {
 		headless,
 		image: look.image,
 		node: outlineNodeByRef,
 		center: outlineNodeCenter,
 		validatePoint: (x, y, label) => ensurePointIsInLookImage(x, y, look, label),
-	});
+		resolveText: (text, label) => {
+			const candidate = resolveTextInOutline(look.parsedOutline!, look, text, label);
+			const useNode = candidate.source === "label" && candidate.node.wireRef && !candidate.node.pictureOnly;
+			return useNode ? { node: candidate.node } : { node: candidate.node, point: candidate.point };
+		},
+		foreignEndpoint: foreignDragEndpoint,
+		supportsScreenPoints: process.platform === "darwin",
+		supportsWindowKeyboard: process.platform === "darwin",
+	};
+}
+
+function prepareUiAction(action: UiAction, state: ActionState, look: LookResponse, headless: boolean): PreparedAction {
+	return prepareAction(action, state, actionEnvironment(look, headless), operationState().currentCapture?.stateId);
+}
+
+/**
+ * Validates a whole transaction before any write is scheduled. Validation
+ * errors (bad refs, out-of-image points, ambiguous text) must not advance the
+ * root's epoch: doing so silently invalidated every other state for the root.
+ */
+function preflightUiTransaction(actions: UiAction[], look: LookResponse, headless: boolean): void {
+	const actionState: ActionState = { currentFocus: false };
+	for (const [index, action] of actions.entries()) {
+		try {
+			const prepared = prepareUiAction(action, actionState, look, headless);
+			if (!headless && prepared.action !== "wait" && "target" in prepared && (prepared.establishesFocus || (prepared.action === "click" && "x" in prepared.target))) actionState.currentFocus = true;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			throw new Error(`act_ui.actions[${index}] (${action.action}) was rejected before anything was sent: ${message}`);
+		}
+	}
 }
 
 async function dispatchUiAction(action: UiAction, target: ResolvedTarget, look: LookResponse, headless: boolean, state: ActionState, signal?: AbortSignal): Promise<ExecutionTrace> {
@@ -1818,7 +1978,7 @@ async function dispatchUiTransaction(actions: UiAction[], target: ResolvedTarget
 	// Strict-headless batches have one immutable delivery class. When foreground
 	// fallback is permitted, decide independently per action so a completed
 	// background prefix is never replayed as part of a foreground batch.
-	if (headless && currentPlatformBackend.actBatch) {
+	if (headless && currentPlatformBackend.actBatch && !actions.some((action) => action.action === "wait")) {
 		const actionState: ActionState = { currentFocus: false };
 		const requests = actions.map((action) => helperActRequest(target, prepareUiAction(action, actionState, look, true) as NativePreparedAction, "ax_only"));
 		const textLength = actions.reduce((sum, action) => sum + (action.text?.length ?? 0), 0);
@@ -1960,6 +2120,13 @@ export async function terminalDesktopActionResult(
 	};
 }
 
+/** Capture settings for the successor state of act_ui / wait_for. */
+function successorObservation(mode: SuccessorObserveMode | undefined): { imageMode: ImageMode; readText: "auto" | "always" | "never"; maxDimension: number } {
+	if (mode === "visual") return { imageMode: "always", readText: "always", maxDimension: EXPLICIT_IMAGE_MAX_DIMENSION };
+	if (mode === "semantic") return { imageMode: "never", readText: "never", maxDimension: AUTO_IMAGE_MAX_DIMENSION };
+	return { imageMode: "auto", readText: "auto", maxDimension: AUTO_IMAGE_MAX_DIMENSION };
+}
+
 async function performDesktopTransaction(params: ActParams, actions: UiAction[], signal?: AbortSignal): Promise<AgentToolResult<ComputerUseDetails | TerminalDesktopActionDetails>> {
 	const state = operationState();
 	state.currentImageMode = "auto";
@@ -1968,6 +2135,8 @@ async function performDesktopTransaction(params: ActParams, actions: UiAction[],
 	const baseView = { stateId: state.currentCapture!.stateId, outline: state.currentOutline! };
 	const condition = params.expect ? validateCondition(params.expect) : undefined;
 	const scopeNode = condition ? conditionScopeNode(look.parsedOutline!, condition) : undefined;
+	preflightUiTransaction(actions, look, getComputerUseConfig().headless);
+	const observe = successorObservation(params.observe);
 	const target = await ensureTargetWindowId(await resolveCurrentTarget(signal, { preferModal: false }), signal);
 	const noteBefore = state.currentNote;
 	return await withWindowWriteLock(target, async () => {
@@ -2008,7 +2177,8 @@ async function performDesktopTransaction(params: ActParams, actions: UiAction[],
 			} else {
 				await sleep(settleMsForExecution(execution), signal);
 			}
-			const capture = await captureCurrentTarget(signal, "auto", AUTO_IMAGE_MAX_DIMENSION, target);
+			state.currentImageMode = observe.imageMode;
+			const capture = await captureCurrentTarget(signal, observe.readText, observe.maxDimension, target, observe.imageMode !== "never");
 			execution.outcome = outcomeAfterObservedValues(execution.outcome ?? "unknown", executedActions, (ref) => nodeByRef(capture.outline, ref)?.value);
 			for (const action of executedActions) {
 				state.currentNote = noteAfterAct(state.currentNote ?? noteBefore, action.ref, capture.outline, { window: noteWindowForTarget(capture.target, capture.look), rootDelta: execution.rootDelta });
@@ -2034,6 +2204,9 @@ async function performBrowserTransaction(params: ActParams, actions: UiAction[],
 	if (condition) conditionScopeNode(restoreOutline(baseSnapshot.outline), condition);
 	const prepared = actions.map((action) => {
 		if (!BROWSER_TRANSACTION_ACTIONS.has(action.action)) throw new Error(`Browser transactions do not support '${action.action}'.`);
+		if (action.space === "screen" || action.from || action.to || ((action.action === "click" || action.action === "moveMouse") && action.text && !action.ref)) {
+			throw new Error(`Browser (CDP) states accept refs and page x/y only; text targets, from/to drags, and space "screen" are desktop-only. Use search_ui to find a ref, or drag with path.`);
+		}
 		if (action.action === "click" && action.ref && action.button && action.button !== "left") throw new Error("Browser ref clicks support only the left button; use coordinate clicks for right or middle buttons.");
 		const target = browserSnapshotTarget(params.stateId, trimOrUndefined(action.ref));
 		if ((action.action === "press" || action.action === "setText" || (action.action === "click" && action.ref) || (action.action === "typeText" && action.ref)) && !Number.isFinite(target?.backendNodeId)) {
@@ -2045,7 +2218,10 @@ async function performBrowserTransaction(params: ActParams, actions: UiAction[],
 	return await withBrowserWrite(contextId, async () => {
 		for (const { action, target } of prepared) {
 			let worked = false;
-			if (action.action === "press" || (action.action === "click" && action.ref)) {
+			if (action.action === "wait") {
+				await sleep(Math.max(0, Math.min(10_000, toFiniteNumber(action.ms, 0))), signal);
+				worked = true;
+			} else if (action.action === "press" || (action.action === "click" && action.ref)) {
 				worked = true;
 				for (let count = 0; count < (action.clickCount ?? 1); count += 1) worked = await cdpClickForContext(contextId, target!.backendNodeId!) && worked;
 			} else if (action.action === "click") {
@@ -2087,8 +2263,22 @@ function validateActionTarget(action: UiAction): void {
 	const hasY = Number.isFinite(action.y);
 	if (hasX !== hasY) throw new Error(`${action.action} coordinates require both x and y.`);
 	const hasPoint = hasX && hasY;
-	if ((action.action === "click" || action.action === "moveMouse") && hasRef === hasPoint) {
-		throw new Error(`${action.action} requires exactly one target: ref or x/y coordinates.`);
+	if (action.action === "click" || action.action === "moveMouse") {
+		const hasText = Boolean(trimOrUndefined(action.text));
+		if (Number(hasRef) + Number(hasPoint) + Number(hasText) !== 1) {
+			throw new Error(`${action.action} requires exactly one target: ref, text, or x/y coordinates.`);
+		}
+	}
+	if (action.action === "wait" && (!Number.isFinite(action.ms) || action.ms! < 0 || action.ms! > 10_000)) throw new Error("wait requires ms between 0 and 10000.");
+	if (action.action === "drag") {
+		const hasEndpoints = Boolean(action.from || action.to);
+		if (hasEndpoints === Boolean(action.path?.length)) throw new Error("drag requires either from+to or path (at least two points), not both.");
+		for (const [name, endpoint] of [["from", action.from], ["to", action.to]] as const) {
+			if (!hasEndpoints) break;
+			if (!endpoint) throw new Error(`drag.${name} is required when using from/to.`);
+			const kinds = Number(Boolean(trimOrUndefined(endpoint.ref))) + Number(Boolean(trimOrUndefined(endpoint.text))) + Number(Number.isFinite(endpoint.x) && Number.isFinite(endpoint.y));
+			if (kinds !== 1) throw new Error(`drag.${name} requires exactly one of ref, text, or x+y.`);
+		}
 	}
 	if (action.action === "press" && !hasRef) throw new Error("press requires an actionable ref.");
 	if (action.action === "scroll" && toFiniteNumber(action.scrollX, 0) === 0 && toFiniteNumber(action.scrollY, 0) === 0) throw new Error("scroll requires a non-zero scrollX or scrollY delta.");
@@ -2295,7 +2485,13 @@ async function executeTool<P, T>(ctx: ExtensionContext, params: P, signal: Abort
 	return await savedStates.operations.run(operation, async () => {
 		await resourceScheduler.read("session-lifecycle", async () => await ensureReady(ctx, signal));
 		throwIfAborted(signal);
-		const result = await run();
+		let result: T;
+		try {
+			result = await run();
+		} catch (error) {
+			if (error instanceof StaleResourceStateError) throw new Error(staleStateMessage(error));
+			throw error;
+		}
 		persistOperation(operation);
 		return result;
 	});
@@ -2569,6 +2765,35 @@ Coordinate fallback uses image pixels from the observed state:
 ```ts
 act_ui({ stateId, actions: [{ action: "click", x: 420, y: 300 }] })
 ```
+
+Image-bearing results print one coordinate legend line: the image size, and the screen frame the root occupies. Pass `space: "screen"` to give global screen points instead; the native helper grounds them and rejects points outside the acting root.
+
+### One-shot actions
+
+Prefer one transaction over several round trips:
+
+- `{ action: "click", text: "Import" }` targets a visible label or recognized (OCR) text. Exact, prefix, and substring matches are accepted; fuzzy matches are not. When a control and inert text tie, the control wins; otherwise ambiguity is an error that lists the candidate refs and points.
+- `{ action: "wait", ms: 400 }` pauses inside the transaction for menus, sheets, or loading states.
+- `observe: "visual"` on `act_ui` or `wait_for` attaches the successor screenshot, so no follow-up `observe_ui` is needed. Never run `observe_ui` and `act_ui` for the same root in parallel: the act advances the root's epoch and makes the parallel observation stale.
+- `keypress`/`typeText` without a `ref` deliver to the root's focused control.
+- `find_roots({ app, launch: true })` launches the app when needed and waits for its window; `waitMs` polls for slow windows.
+
+Drags take `from`/`to` endpoints (`ref`, `text`, or `x`+`y`). An endpoint with another root's `stateId` drops into that window or app; act on the source window's state:
+
+```ts
+act_ui({
+  stateId: finderState,
+  actions: [
+    { action: "drag", from: { text: "song.wav" }, to: { text: "Collection", stateId: engineState } },
+    { action: "wait", ms: 800 },
+  ],
+  observe: "visual",
+})
+```
+
+Drags use physical input. The helper presses and holds (`holdMs`, default 250), travels through interpolated points, and hovers over the target (`dwellMs`, default 400) so OS drag sessions start and drop targets can accept. A covered drop root is raised first, and a drop that would land on a different app fails with `occluded_target` before anything is pressed.
+
+Validation (unknown refs, out-of-image points, ambiguous text) happens before a transaction is scheduled, so a rejected `act_ui` never invalidates other states. If a state is stale anyway, the error names the latest state for that root.
 
 ## Bounded output
 

@@ -700,3 +700,75 @@ export function graftScopedOutline(outline: Outline, targetRef: string, scoped: 
 	rebuildIndexes(outline);
 	return target;
 }
+
+export interface TextTargetCandidate {
+	node: OutlineNode;
+	/** Image-pixel point for the match; the matched OCR run when the hit came from visual text. */
+	point: { x: number; y: number };
+	/** On-screen extent of the hit: the node for label hits, the OCR run for visual-text hits. */
+	rect: OutlineRect;
+	reason: "exact" | "prefix" | "substring";
+	source: "label" | "ocr";
+	actionable: boolean;
+	area: number;
+}
+
+export type TextTargetResolution =
+	| { kind: "ok"; candidate: TextTargetCandidate }
+	| { kind: "none" }
+	| { kind: "ambiguous"; candidates: TextTargetCandidate[] };
+
+const TEXT_REASON_RANK = { exact: 0, prefix: 1, substring: 2 } as const;
+
+function rectCenter(rect: OutlineRect): { x: number; y: number } {
+	return { x: rect.x + rect.w / 2, y: rect.y + rect.h / 2 };
+}
+
+function pointInRect(point: { x: number; y: number }, rect: OutlineRect | undefined): boolean {
+	return Boolean(rect && point.x >= rect.x && point.y >= rect.y && point.x <= rect.x + rect.w && point.y <= rect.y + rect.h);
+}
+
+function nodeIsActionable(node: OutlineNode): boolean {
+	return node.canPress || node.canFocus || node.canSetValue || node.pictureOnly || node.actions.some((action) => !INCIDENTAL_ACTIONS.has(action));
+}
+
+/**
+ * Resolves visible text to one clickable point. Label hits target the node;
+ * OCR hits target the recognized text run (OCR runs are often attached to a
+ * large container, so the container center would be wrong). Fuzzy matches are
+ * never auto-targeted. Hits that land on the same spot collapse to the most
+ * specific actionable node, so a button and its own label count once.
+ */
+export function resolveTextTarget(outline: Outline, text: string): TextTargetResolution {
+	const candidates: TextTargetCandidate[] = [];
+	for (const node of outline.nodes) {
+		if (node.offscreen) continue;
+		const labelMatch = rankedTextMatch([outlineNodeLabel(node), node.title, node.description, node.value, node.identifier], text);
+		if (labelMatch && labelMatch.reason !== "fuzzy" && node.rect && node !== outline.root) {
+			candidates.push({ node, point: rectCenter(node.rect), rect: node.rect, reason: labelMatch.reason, source: "label", actionable: nodeIsActionable(node), area: node.rect.w * node.rect.h });
+			continue;
+		}
+		for (const item of node.text) {
+			if (!item.rect) continue;
+			const match = rankedTextMatch([item.string], text);
+			if (!match || match.reason === "fuzzy") continue;
+			candidates.push({ node, point: rectCenter(item.rect), rect: item.rect, reason: match.reason, source: "ocr", actionable: node !== outline.root && nodeIsActionable(node), area: item.rect.w * item.rect.h });
+		}
+	}
+	if (candidates.length === 0) return { kind: "none" };
+	const bestRank = Math.min(...candidates.map((candidate) => TEXT_REASON_RANK[candidate.reason]));
+	const ranked = candidates.filter((candidate) => TEXT_REASON_RANK[candidate.reason] === bestRank);
+	// "Click the text" means a control: when actionable and inert hits tie
+	// (a "7" button vs a display showing 7), the actionable ones win.
+	const actionable = ranked.filter((candidate) => candidate.actionable);
+	const best = actionable.length > 0 ? actionable : ranked;
+	// Collapse candidates that describe the same on-screen spot.
+	const distinct: TextTargetCandidate[] = [];
+	const preference = (candidate: TextTargetCandidate) => (candidate.actionable ? 0 : 1) * 1e12 + (candidate.source === "label" ? 0 : 1) * 1e11 + candidate.area;
+	for (const candidate of [...best].sort((a, b) => preference(a) - preference(b))) {
+		const duplicate = distinct.some((kept) => pointInRect(candidate.point, kept.rect) || pointInRect(kept.point, candidate.rect) || Math.hypot(kept.point.x - candidate.point.x, kept.point.y - candidate.point.y) < 12);
+		if (!duplicate) distinct.push(candidate);
+	}
+	if (distinct.length === 1) return { kind: "ok", candidate: distinct[0] };
+	return { kind: "ambiguous", candidates: distinct };
+}

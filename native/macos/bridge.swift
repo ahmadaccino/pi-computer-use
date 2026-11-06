@@ -1489,7 +1489,7 @@ final class Bridge {
 		defer { lookRecordLock.unlock() }
 		lookRecords[record.lookId] = record
 		lookRecordOrder.append(record.lookId)
-		while lookRecordOrder.count > 8 {
+		while lookRecordOrder.count > 32 {
 			let oldest = lookRecordOrder.removeFirst()
 			lookRecords.removeValue(forKey: oldest)
 		}
@@ -1964,11 +1964,23 @@ final class Bridge {
 			guard record.hasImage else {
 				throw BridgeFailure(message: "Coordinate targeting is unavailable for this outline-only root", code: "coordinate_unavailable_for_root")
 			}
-			rawPoint = lookPoint(record: record, x: xNumber.doubleValue, y: yNumber.doubleValue)
+			if (target["space"] as? String) == "screen" {
+				let screenPoint = CGPoint(x: xNumber.doubleValue, y: yNumber.doubleValue)
+				guard record.windowFrame.insetBy(dx: -1, dy: -1).contains(screenPoint) else {
+					throw BridgeFailure(message: "Screen point (\(Int(screenPoint.x)),\(Int(screenPoint.y))) is outside this root's frame (\(Int(record.windowFrame.minX)),\(Int(record.windowFrame.minY)) \(Int(record.windowFrame.width))x\(Int(record.windowFrame.height))); observe the root that contains it", code: "point_outside_root")
+				}
+				rawPoint = screenPoint
+			} else {
+				rawPoint = lookPoint(record: record, x: xNumber.doubleValue, y: yNumber.doubleValue)
+			}
+			beforeValue = nil
+			beforeSelected = nil
+		} else if (target["window"] as? Bool) == true, action == "keypress" || action == "typeText" {
+			// Keyboard input for the root's focused control; the root is raised below.
 			beforeValue = nil
 			beforeSelected = nil
 		} else {
-			throw BridgeFailure(message: "act target must include ref or x/y", code: "invalid_args")
+			throw BridgeFailure(message: "act target must include ref, x/y, or window (keyboard only)", code: "invalid_args")
 		}
 
 		func coordinatePoint() throws -> CGPoint {
@@ -2042,14 +2054,63 @@ final class Bridge {
 				guard let rawPath = params["path"] as? [[String: Any]], rawPath.count >= 2 else {
 					throw BridgeFailure(message: "drag requires path", code: "invalid_args")
 				}
+				// Waypoints are acting-look pixels, pixels of another cached look
+				// (lookId, for cross-window drops), or global screen points.
+				var crossesRoot = false
+				var dropRoots: [(pid: Int32, record: LookRecord, point: CGPoint)] = []
 				let points = try rawPath.map { raw -> CGPoint in
 					guard let x = (raw["x"] as? NSNumber)?.doubleValue, let y = (raw["y"] as? NSNumber)?.doubleValue else {
 						throw BridgeFailure(message: "drag path entries require x and y", code: "invalid_args")
 					}
+					if (raw["space"] as? String) == "screen" {
+						crossesRoot = true
+						return CGPoint(x: x, y: y)
+					}
+					if let otherLookId = raw["lookId"] as? String, otherLookId != lookId {
+						guard let other = lookRecord(for: otherLookId) else {
+							throw BridgeFailure(message: "Drop target look '\(otherLookId)' is no longer available; observe that root again", code: "stale_look")
+						}
+						crossesRoot = true
+						let mapped = lookPoint(record: other, x: x, y: y)
+						if let otherPid = (raw["pid"] as? NSNumber)?.int32Value { dropRoots.append((otherPid, other, mapped)) }
+						return mapped
+					}
 					return lookPoint(record: record, x: x, y: y)
 				}
-				animateCursor(at: point)
-				try postMouseDrag(points: points, pid: pid, delivery: delivery)
+				guard record.windowFrame.insetBy(dx: -1, dy: -1).contains(points[0]) else {
+					throw BridgeFailure(message: "Drag must start inside the acting root", code: "point_outside_root")
+				}
+				performed["dragCrossesRoot"] = crossesRoot
+				if !dropRoots.isEmpty {
+					// A drop root hidden behind another app would receive nothing (the
+					// drop lands on whatever covers it): raise each drop root, then the
+					// source, and refuse to drop onto a different app.
+					for drop in dropRoots {
+						if drop.pid != pid, let app = NSRunningApplication(processIdentifier: drop.pid), !app.isActive {
+							_ = app.activate()
+							usleep(120_000)
+						}
+						if let window = windowElement(pid: drop.pid, windowId: drop.record.windowId > 0 ? drop.record.windowId : nil, windowRef: drop.record.windowRef) {
+							_ = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+						}
+						usleep(80_000)
+					}
+					focusTargetForPhysicalInput()
+					usleep(80_000)
+					for drop in dropRoots {
+						guard let hit = hitTestElement(at: drop.point) else { continue }
+						var hitPid: pid_t = 0
+						if AXUIElementGetPid(hit, &hitPid) == .success, hitPid != drop.pid {
+							let owner = NSRunningApplication(processIdentifier: hitPid)?.localizedName ?? "pid \(hitPid)"
+							throw BridgeFailure(message: "Drop target is covered by \(owner); move that window or observe a visible part of the drop root", code: "occluded_target")
+						}
+					}
+					performed["dropRootsRaised"] = dropRoots.count
+				}
+				let holdMs = max(0, min(5_000, (params["holdMs"] as? NSNumber)?.intValue ?? 250))
+				let dwellMs = max(0, min(5_000, (params["dwellMs"] as? NSNumber)?.intValue ?? 400))
+				animateCursor(at: points[0])
+				try postMouseDrag(points: points, pid: pid, delivery: delivery, holdMs: holdMs, dwellMs: dwellMs)
 			default:
 				throw BridgeFailure(message: "Action \(action) cannot use coordinate grounding", code: "invalid_args")
 			}
@@ -3453,33 +3514,59 @@ final class Bridge {
 		}
 	}
 
-	private func postMouseDrag(points: [CGPoint], pid: Int32, delivery: String = "hid") throws {
+	/// Drag like a person: press, hold so AppKit/Qt/Finder start a drag session,
+	/// move through interpolated points (drop targets track mouseDragged), hover
+	/// over the destination so it can accept, then release.
+	private func postMouseDrag(points: [CGPoint], pid: Int32, delivery: String = "hid", holdMs: Int = 250, dwellMs: Int = 400) throws {
 		if delivery == "hid" { physicalInputLock.lock() }
 		defer { if delivery == "hid" { physicalInputLock.unlock() } }
-		guard points.count >= 2, let first = points.first else {
+		guard points.count >= 2, let first = points.first, let last = points.last else {
 			throw BridgeFailure(message: "Drag requires at least two points", code: "invalid_args")
 		}
-		try postMouseMove(to: first, pid: pid, delivery: delivery)
+		guard let move = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: first, mouseButton: .left) else {
+			throw BridgeFailure(message: "Failed to create mouse move event", code: "input_failed")
+		}
+		postEvent(move, pid: pid, delivery: delivery)
+		usleep(60_000)
 		guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: first, mouseButton: .left) else {
 			throw BridgeFailure(message: "Failed to create mouse down event", code: "input_failed")
 		}
 		postEvent(down, pid: pid, delivery: delivery)
-		usleep(12_000)
+		usleep(useconds_t(max(12, holdMs)) * 1_000)
 
-		for point in points.dropFirst() {
+		func dragEvent(_ point: CGPoint) throws {
 			guard let drag = CGEvent(mouseEventSource: nil, mouseType: mouseDraggedType(for: .left), mouseCursorPosition: point, mouseButton: .left) else {
 				throw BridgeFailure(message: "Failed to create mouse drag event", code: "input_failed")
 			}
 			postEvent(drag, pid: pid, delivery: delivery)
-			usleep(8_000)
 		}
-
-		guard let last = points.last,
-			let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: last, mouseButton: .left)
-		else {
+		// Nudge past the platform drag threshold before travelling.
+		try dragEvent(CGPoint(x: first.x + 3, y: first.y + 3))
+		usleep(30_000)
+		var previous = first
+		for point in points.dropFirst() {
+			let distance = hypot(point.x - previous.x, point.y - previous.y)
+			let steps = max(2, min(120, Int(distance / 12)))
+			for step in 1...steps {
+				let t = CGFloat(step) / CGFloat(steps)
+				try dragEvent(CGPoint(x: previous.x + (point.x - previous.x) * t, y: previous.y + (point.y - previous.y) * t))
+				usleep(10_000)
+			}
+			previous = point
+		}
+		// Hover on the destination; many drop targets only highlight/accept after
+		// several drag events at rest.
+		let dwellSteps = max(1, dwellMs / 50)
+		for index in 0..<dwellSteps {
+			try dragEvent(CGPoint(x: last.x + (index % 2 == 0 ? 0 : 1), y: last.y))
+			usleep(50_000)
+		}
+		try dragEvent(last)
+		guard let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: last, mouseButton: .left) else {
 			throw BridgeFailure(message: "Failed to create mouse up event", code: "input_failed")
 		}
 		postEvent(up, pid: pid, delivery: delivery)
+		usleep(30_000)
 	}
 
 	private func postScrollWheel(at point: CGPoint, deltaX: Int, deltaY: Int, pid: Int32, delivery: String = "hid") throws {

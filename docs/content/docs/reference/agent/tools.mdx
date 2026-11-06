@@ -13,7 +13,7 @@ Find a bounded, ranked set of controllable UI roots with refs, geometry, and foc
 
 ### agent guidance
 
-Find a target root before observe_ui when needed.
+Find a target root before observe_ui when needed; launch:true opens an app and waits for its window.
 
 ### parameters
 
@@ -24,6 +24,8 @@ Find a target root before observe_ui when needed.
 | `bundleId` | `string` | no | Exact bundle id |
 | `pid` | `integer` | no | Exact positive process id minimum: `1`. |
 | `kind` | `window` \| `menu` \| `sheet` \| `popover` \| `dialog` \| `browser_page` | no | Exact root kind |
+| `launch` | `boolean` | no | Launch the app (app or bundleId) if it is not running, then wait for its window (macOS) |
+| `waitMs` | `number` | no | Poll until a matching root appears, up to this long (default 20000 with launch) minimum: `0`, maximum: `60000`. |
 
 ## `observe_ui`
 
@@ -99,9 +101,13 @@ Perform one or more precisely targeted checked actions and return the successor 
 
 ### agent guidance
 
-Pass dependent click/type steps together and use expect for observable completion.
+Pass dependent click/type/wait steps together in one call, use expect for observable completion, and observe:"visual" to get the successor screenshot.
 
 - After clicking an editable region, omit ref from typeText/keypress so input follows the established focus.
+- Prefer one act_ui with several actions (insert {action:"wait",ms} for menus/loading) over many single-action calls.
+- Pass observe:"visual" when you will need to look at the result; do not run observe_ui in parallel with act_ui on the same root (it makes states stale).
+- Target custom-drawn/unlabeled controls with {action:"click",text:"Label"} (label or OCR text) or x/y in the state's image pixels; space:"screen" takes global screen points.
+- Drag between windows/apps in one action: act_ui on the source window's state with drag from:{ref|text} to:{ref|text, stateId:<other root's state>}.
 
 ### parameters
 
@@ -116,6 +122,7 @@ Pass dependent click/type steps together and use expect for observable completio
 | `expect.value` | `string` | no | Exact normalized value; normally pair with ref |
 | `expect.until` | `present` \| `absent` | no | Desired condition, default present |
 | `expect.timeoutMs` | `number` | no | Maximum wait, default 10000ms minimum: `100`, maximum: `60000`. |
+| `observe` | `semantic` \| `visual` \| `fused` | no | Successor observation; visual attaches the new screenshot so no follow-up observe_ui is needed |
 | `actions` | array of union | yes | — minItems: `1`, maxItems: `20`. |
 
 #### action variants
@@ -124,13 +131,16 @@ Pass dependent click/type steps together and use expect for observable completio
 | --- | --- |
 | `press` | `ref`: `string` (required) |
 | `click` | `ref`: `string` (required); `button`: `left` \| `right` \| `middle` (optional); `clickCount`: `number` (optional) minimum: `1`, maximum: `3`. |
-| `click` | `x`: `number` (required); `y`: `number` (required); `button`: `left` \| `right` \| `middle` (optional); `clickCount`: `number` (optional) minimum: `1`, maximum: `3`. |
+| `click` | `x`: `number` (required); `y`: `number` (required); `space`: `image` \| `screen` (optional); `button`: `left` \| `right` \| `middle` (optional); `clickCount`: `number` (optional) minimum: `1`, maximum: `3`. |
+| `click` | `text`: `string` (required); `button`: `left` \| `right` \| `middle` (optional); `clickCount`: `number` (optional) minimum: `1`, maximum: `3`. |
 | `setText` | `ref`: `string` (required); `text`: `string` (required) |
 | `typeText` | `ref`: `string` (optional); `text`: `string` (required) |
 | `keypress` | `ref`: `string` (optional); `keys`: array of `string` (required) minItems: `1`. |
 | `scroll` | `ref`: `string` (optional); `scrollX`: `number` (optional); `scrollY`: `number` (optional) |
-| `drag` | `path`: array of object (x: `number`, y: `number`) (required) minItems: `2`. |
-| `moveMouse` | `x`: `number` (required); `y`: `number` (required) |
+| `drag` | `from`: object (ref: `string`, text: `string`, stateId: `string`, x: `number`, y: `number`, space: `image` \| `screen`) (optional); `to`: object (ref: `string`, text: `string`, stateId: `string`, x: `number`, y: `number`, space: `image` \| `screen`) (optional); `path`: array of object (x: `number`, y: `number`) (optional) minItems: `2`.; `space`: `image` \| `screen` (optional); `holdMs`: `number` (optional) minimum: `0`, maximum: `5000`.; `dwellMs`: `number` (optional) minimum: `0`, maximum: `5000`. |
+| `moveMouse` | `x`: `number` (required); `y`: `number` (required); `space`: `image` \| `screen` (optional) |
+| `moveMouse` | `text`: `string` (required) |
+| `wait` | `ms`: `number` (required) minimum: `0`, maximum: `10000`. |
 
 ## `read_text`
 
@@ -167,6 +177,7 @@ Use after asynchronous UI changes instead of polling observe_ui.
 | `value` | `string` | no | Exact normalized value; normally pair with ref |
 | `until` | `present` \| `absent` | no | Desired condition, default present |
 | `timeoutMs` | `number` | no | Maximum wait, default 10000ms minimum: `100`, maximum: `60000`. |
+| `observe` | `semantic` \| `visual` \| `fused` | no | Successor observation; visual attaches the new screenshot so no follow-up observe_ui is needed |
 | `stateId` | `string` | yes | Required state id owning every @e ref used by this operation |
 
 ## `launch_browser`

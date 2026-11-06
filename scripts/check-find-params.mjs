@@ -34,4 +34,16 @@ for (const pid of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
 	);
 }
 
+assert.deepEqual(normalizeFindParams({ app: " Engine DJ ", launch: true, waitMs: 1500.4 }), {
+	text: undefined,
+	app: "Engine DJ",
+	bundleId: undefined,
+	pid: undefined,
+	kind: undefined,
+	launch: true,
+	waitMs: 1500,
+});
+assert.throws(() => normalizeFindParams({ launch: true }), /find_roots\.launch requires app or bundleId/);
+assert.throws(() => normalizeFindParams({ app: "x", waitMs: 90_000 }), /waitMs must be between 0 and 60000/);
+
 console.log("Find parameter checks passed.");

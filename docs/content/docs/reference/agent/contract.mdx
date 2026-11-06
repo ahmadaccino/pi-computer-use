@@ -135,6 +135,35 @@ Coordinate fallback uses image pixels from the observed state:
 act_ui({ stateId, actions: [{ action: "click", x: 420, y: 300 }] })
 ```
 
+Image-bearing results print one coordinate legend line: the image size, and the screen frame the root occupies. Pass `space: "screen"` to give global screen points instead; the native helper grounds them and rejects points outside the acting root.
+
+### One-shot actions
+
+Prefer one transaction over several round trips:
+
+- `{ action: "click", text: "Import" }` targets a visible label or recognized (OCR) text. Exact, prefix, and substring matches are accepted; fuzzy matches are not. When a control and inert text tie, the control wins; otherwise ambiguity is an error that lists the candidate refs and points.
+- `{ action: "wait", ms: 400 }` pauses inside the transaction for menus, sheets, or loading states.
+- `observe: "visual"` on `act_ui` or `wait_for` attaches the successor screenshot, so no follow-up `observe_ui` is needed. Never run `observe_ui` and `act_ui` for the same root in parallel: the act advances the root's epoch and makes the parallel observation stale.
+- `keypress`/`typeText` without a `ref` deliver to the root's focused control.
+- `find_roots({ app, launch: true })` launches the app when needed and waits for its window; `waitMs` polls for slow windows.
+
+Drags take `from`/`to` endpoints (`ref`, `text`, or `x`+`y`). An endpoint with another root's `stateId` drops into that window or app; act on the source window's state:
+
+```ts
+act_ui({
+  stateId: finderState,
+  actions: [
+    { action: "drag", from: { text: "song.wav" }, to: { text: "Collection", stateId: engineState } },
+    { action: "wait", ms: 800 },
+  ],
+  observe: "visual",
+})
+```
+
+Drags use physical input. The helper presses and holds (`holdMs`, default 250), travels through interpolated points, and hovers over the target (`dwellMs`, default 400) so OS drag sessions start and drop targets can accept. A covered drop root is raised first, and a drop that would land on a different app fails with `occluded_target` before anything is pressed.
+
+Validation (unknown refs, out-of-image points, ambiguous text) happens before a transaction is scheduled, so a rejected `act_ui` never invalidates other states. If a state is stale anyway, the error names the latest state for that root.
+
 ## Bounded output
 
 Every model-visible textual result is limited to 48 KiB or 2,000 lines. Oversized results return a 16 KiB preview, focused-query guidance, and an immutable `@o` continuation. Discovery tools don't page through irrelevant matches: refine `find_roots` and `search_ui` instead. Continuation is intended for concrete long text, evaluation values, and diagnostics.
