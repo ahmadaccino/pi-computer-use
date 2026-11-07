@@ -164,6 +164,24 @@ Drags use physical input. The helper presses and holds (`holdMs`, default 250), 
 
 Validation (unknown refs, out-of-image points, ambiguous text) happens before a transaction is scheduled, so a rejected `act_ui` never invalidates other states. If a state is stale anyway, the error names the latest state for that root.
 
+### Checked when it acts
+
+The first step of a desktop transaction is checked against the app as it is when the step runs, not only as it was observed. If a window, sheet, or menu opened or closed, or focus moved to another window, since the state was captured, the helper sends nothing; `act_ui` returns `Not executed` with `error.code: "ui_changed"` and a fresh state to decide on. Later steps of the same transaction are not checked, because they act on changes the earlier steps made deliberately.
+
+### Menus, dialogs, and apps
+
+`menu_commands({ app: "Finder", query: "folder" })` reads the menu bar as commands (path, shortcut, enabled, checked) without opening a menu. Run one with `act_ui({ stateId, actions: [{ action: "menu", command: "File > New Folder" }] })`; it presses the item through Accessibility, so the app can stay in the background. Menu commands act on the app's key window.
+
+`{ action: "choosePath", location: "~/Music", confirm: true }` drives an open Open/Save panel through Go to Folder in one step.
+
+`app_control` launches, quits, relaunches (with `args`), activates, or hides an app; launch and relaunch wait for a window and return its roots. Electron and CEF apps expose page content only with renderer accessibility; when such an app observes nearly empty, `observe_ui` suggests `app_control({ action: "relaunch", app, args: ["--force-renderer-accessibility"] })`.
+
+`observe_ui({ root, annotate: true })` draws every interactive control's box and `@e` ref onto the screenshot, which makes unlabeled, custom-drawn controls addressable.
+
+### Background input
+
+With `background_input` (the macOS default), keyboard input without a semantic target is addressed to the target window through SkyLight with key focus lent only for the event batch, so the user's front app and cursor are untouched; Command shortcuts go through the owning menu item. Background coordinate clicks are opt-in (`background_pointer`) because some apps ignore them. Successor settling follows the app's Accessibility notifications: an idle app settles in about 0.15 s, a reacting one 0.1 s after it goes quiet, within the previous 0.4 s bound.
+
 ## Bounded output
 
 Every model-visible textual result is limited to 48 KiB or 2,000 lines. Oversized results return a 16 KiB preview, focused-query guidance, and an immutable `@o` continuation. Discovery tools don't page through irrelevant matches: refine `find_roots` and `search_ui` instead. Continuation is intended for concrete long text, evaluation values, and diagnostics.

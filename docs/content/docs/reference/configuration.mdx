@@ -31,7 +31,9 @@ Example:
   "managed_browser": "chrome",
   "headless": false,
   "cursor_overlay": true,
-  "activity_glow": true
+  "activity_glow": true,
+  "background_input": true,
+  "background_pointer": false
 }
 ```
 
@@ -73,6 +75,18 @@ When `true`, macOS displays a click-through pulsing border on every screen while
 
 The activity glow appears in user screen recordings, but never in the agent's own observations: helper captures always target a single window, so screen-edge overlays are not included. The glow is excluded from accessibility discovery. Other platforms ignore this setting, and `headless: true` always suppresses it ([macOS reference](./platforms/macos/implementation.mdx#activity-glow)).
 
+### `background_input`
+
+Default: `true`
+
+When `true` on macOS, keyboard input that would otherwise need the foreground (`typeText`/`keypress` without a semantic target, and keys after a coordinate click) is addressed to the target window through private WindowServer (SkyLight) calls. Key focus is lent to that window for the event batch and handed back, so the user's front app and cursor stay put. Command shortcuts are run through the app's own menu item when one owns them, since key equivalents only reach the front app. The helper reports availability as `backgroundInput` in its diagnostics and falls back to the previous delivery when a symbol is missing. Approach adapted from arc-cua (MIT).
+
+### `background_pointer`
+
+Default: `false`
+
+Experimental. When `true` (with `background_input`), coordinate clicks, moves, and scrolls are also delivered to the window in the background instead of raising it and moving the cursor. Some apps ignore these events (SwiftUI controls and Finder's sidebar did on macOS 27), and a coordinate click cannot verify itself, so the default keeps pointer input in the foreground. Drags always use the real pointer.
+
 ## Environment variables
 
 ```bash
@@ -88,6 +102,8 @@ PI_COMPUTER_USE_CURSOR_OVERLAY=0
 PI_COMPUTER_USE_CURSOR_OVERLAY=1
 PI_COMPUTER_USE_ACTIVITY_GLOW=0
 PI_COMPUTER_USE_ACTIVITY_GLOW=1
+PI_COMPUTER_USE_BACKGROUND_INPUT=0
+PI_COMPUTER_USE_BACKGROUND_POINTER=1
 PI_COMPUTER_USE_DELIVERY_POLICY=default
 PI_COMPUTER_USE_DELIVERY_POLICY=foreground
 PI_COMPUTER_USE_CDP_PORT=9222

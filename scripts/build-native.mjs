@@ -12,6 +12,7 @@ const macosSourcePaths = [
 	"agent_cursor.swift",
 	"agent_cursor_motion.swift",
 	"bridge.swift",
+	"skylight_input.swift",
 ].map((file) => path.join(rootDir, "native", "macos", file));
 const windowsCrateDir = path.join(rootDir, "native", "windows", "bridge-rs");
 const linuxCrateDir = path.join(rootDir, "native", "linux", "bridge-rs");

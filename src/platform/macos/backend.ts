@@ -1,7 +1,7 @@
 import { getComputerUseConfig } from "../../config.ts";
 import { parseLookResponse, type LookResponse } from "../../outline.ts";
 import { toBoolean, toFiniteNumber, toOptionalString } from "../coerce.ts";
-import type { ComputerUsePlatformBackend, FramePoints, HelperActResult, PlatformActRequest, PlatformApp, PlatformFocusWindowResult, PlatformFrontmostResult, PlatformObserveRequest, PlatformReadTextRequest, PlatformReadTextResponse, PlatformRoot, PlatformRootKind, PlatformRootQuery, PlatformTarget, PlatformWaitForRequest, PlatformWaitForResponse } from "../types.ts";
+import type { ComputerUsePlatformBackend, FramePoints, HelperActResult, PlatformActRequest, PlatformApp, PlatformFocusWindowResult, PlatformFrontmostResult, PlatformMenuListResponse, PlatformObserveRequest, PlatformReadTextRequest, PlatformReadTextResponse, PlatformRoot, PlatformRootKind, PlatformRootQuery, PlatformTarget, PlatformWaitForRequest, PlatformWaitForResponse } from "../types.ts";
 import { macosActivityGlow, macosHelper } from "./helper.ts";
 
 function parseApps(result: unknown): PlatformApp[] {
@@ -18,6 +18,7 @@ function parseApps(result: unknown): PlatformApp[] {
 				bundleId: toOptionalString((raw as any)?.bundleId),
 				pid,
 				isFrontmost: toBoolean((raw as any)?.isFrontmost),
+				...((raw as any)?.embedsChromium === true ? { embedsChromium: true } : {}),
 			} as PlatformApp;
 		})
 		.filter((item): item is PlatformApp => Boolean(item));
@@ -79,7 +80,7 @@ function helperAction(request: PlatformActRequest): Record<string, unknown> {
 	return { ...request, target: request.target.focus, params: { ...request.params, preserveFocus: true } };
 }
 
-export const macosBackend: Pick<ComputerUsePlatformBackend, "shutdown" | "setActivity" | "listApps" | "listRoots" | "getFrontmost" | "focusWindow" | "observe" | "act" | "actBatch" | "readText" | "waitFor"> = {
+export const macosBackend: Pick<ComputerUsePlatformBackend, "shutdown" | "setActivity" | "listApps" | "listRoots" | "getFrontmost" | "focusWindow" | "observe" | "act" | "actBatch" | "readText" | "waitFor" | "menuList" | "menuPress" | "annotateImage"> = {
 	async shutdown(): Promise<void> {
 		await macosActivityGlow.close();
 	},
@@ -139,6 +140,18 @@ export const macosBackend: Pick<ComputerUsePlatformBackend, "shutdown" | "setAct
 
 	async readText(args: PlatformReadTextRequest, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<PlatformReadTextResponse> {
 		return await macosHelper.command("axReadText", { ...args }, options);
+	},
+
+	async menuList(request: { pid: number; query?: string; limit?: number }, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<PlatformMenuListResponse> {
+		return await macosHelper.command<PlatformMenuListResponse>("menuList", { ...request }, options);
+	},
+
+	async menuPress(request: { pid: number; path: string }, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ path: string; enabled: boolean }> {
+		return await macosHelper.command("menuPress", { ...request }, options);
+	},
+
+	async annotateImage(request: { jpegBase64: string; boxes: Array<{ x: number; y: number; w: number; h: number; label: string }> }, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ jpegBase64: string; width: number; height: number }> {
+		return await macosHelper.command("annotateImage", { ...request }, options);
 	},
 
 	async waitFor(args: PlatformWaitForRequest, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<PlatformWaitForResponse> {

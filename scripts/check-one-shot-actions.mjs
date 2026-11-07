@@ -4,7 +4,7 @@
 // preflight, successor observation, and stale-state recovery hints.
 import assert from "node:assert/strict";
 
-const { prepareAction } = await import("../src/actions.ts");
+const { prepareAction, expandMacroActions } = await import("../src/actions.ts");
 const { resolveTextTarget } = await import("../src/outline.ts");
 const { testing } = await import("../src/bridge.ts");
 const { StaleResourceStateError } = await import("../src/runtime.ts");
@@ -151,6 +151,28 @@ const fresh = () => ({ currentFocus: false });
 		() => testing.runInOperation(() => testing.preflightUiTransaction([{ action: "wait", ms: 10 }, { action: "click", x: 5, y: 5 }], outlineOnlyLook, false), { currentOutline: outline }),
 		/actions\[1\] \(click\) was rejected before anything was sent: .*image-bearing root/,
 	);
+}
+
+// --- macros, menu commands, background delivery ------------------------------
+{
+	const expanded = expandMacroActions([{ action: "click", ref: "@e1" }, { action: "choosePath", location: "/Volumes/DJUSB", confirm: true }]);
+	assert.deepEqual(expanded.map((action) => action.action), ["click", "keypress", "wait", "keypress", "typeText", "wait", "keypress", "wait", "keypress", "wait"]);
+	assert.deepEqual(expanded[1].keys, ["cmd+shift+g"]);
+	assert.equal(expanded[4].text, "/Volumes/DJUSB");
+	assert.throws(() => expandMacroActions([{ action: "choosePath" }]), /choosePath requires location/);
+
+	const base = env(finderLook, finderOutline, { supportsMenuCommands: true });
+	assert.deepEqual(prepareAction({ action: "menu", command: " File > New Folder " }, fresh(), base).params, { command: "File > New Folder" });
+	assert.throws(() => prepareAction({ action: "menu", command: "Edit > Copy" }, fresh(), env(finderLook, finderOutline)), /not supported on this platform/);
+	assert.throws(() => prepareAction({ action: "menu" }, fresh(), base), /menu requires command/);
+
+	// Keyboard goes to the window in the background when SkyLight is available; pointer stays foreground unless opted in.
+	const keyEnv = env(finderLook, finderOutline, { supportsWindowKeyboard: true, supportsBackgroundInput: true });
+	assert.equal(prepareAction({ action: "keypress", keys: ["escape"] }, fresh(), keyEnv).needsForeground, false);
+	assert.deepEqual(prepareAction({ action: "keypress", keys: ["escape"] }, fresh(), keyEnv).target, { window: true });
+	assert.equal(prepareAction({ action: "keypress", keys: ["escape"] }, fresh(), env(finderLook, finderOutline, { supportsWindowKeyboard: true })).needsForeground, true);
+	assert.equal(prepareAction({ action: "click", x: 10, y: 10 }, fresh(), keyEnv).needsForeground, true);
+	assert.equal(prepareAction({ action: "click", x: 10, y: 10 }, fresh(), { ...keyEnv, supportsBackgroundPointer: true }).needsForeground, false);
 }
 
 console.log("one-shot action checks passed");

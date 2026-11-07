@@ -10,6 +10,14 @@ One-shot desktop actions: fewer tool calls, cross-window drags, and no more self
 - `find_roots` `launch: true` (macOS) and `waitMs`; app-name lookup falls back to a strong name match.
 - Images attach automatically when most controls are unlabeled (custom-drawn UIs).
 
+- Background keyboard input on macOS (`background_input`, default on): keys and text go to the target window through SkyLight with key focus lent per batch, Command shortcuts through the owning menu item; background coordinate clicks are opt-in (`background_pointer`). Adapted from arc-cua (MIT).
+- Freshness guard: the first step of a transaction is refused with `ui_changed` and a fresh state when a window, sheet, or menu changed since the observation.
+- `menu_commands` tool and `act_ui` `{ action: "menu", command }`: menu-bar commands without opening menus.
+- `app_control` tool: launch, quit, relaunch with args, activate, hide; Electron/CEF apps get a `--force-renderer-accessibility` relaunch hint.
+- `observe_ui` `annotate: true` draws control boxes and refs on the screenshot; `act_ui` `choosePath` drives Open/Save panels.
+- Adaptive successor settling on Accessibility notifications (idle apps ~0.15 s instead of 0.4 s).
+- `npm run bench:macos` live benchmark.
+
 ## Changelog
 
 - fixed rejected `act_ui` transactions advancing the root epoch and invalidating every other state for that root

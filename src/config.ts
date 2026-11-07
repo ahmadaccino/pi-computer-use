@@ -7,6 +7,10 @@ export interface ComputerUseConfig {
 	headless: boolean;
 	cursor_overlay: boolean;
 	activity_glow: boolean;
+	/** macOS: deliver pointer and keyboard input to the target window in the background (SkyLight), without moving the user's cursor or focus. */
+	background_input: boolean;
+	/** macOS, experimental: also deliver coordinate clicks/scrolls in the background. Some apps ignore them, so the default keeps pointer input in the foreground. */
+	background_pointer: boolean;
 	managed_browser: "helium" | "chrome";
 }
 
@@ -28,6 +32,8 @@ const DEFAULT_CONFIG: ComputerUseConfig = {
 	headless: false,
 	cursor_overlay: true,
 	activity_glow: false,
+	background_input: true,
+	background_pointer: false,
 	managed_browser: "chrome",
 };
 
@@ -52,6 +58,10 @@ function normalizePartial(raw: unknown): Partial<ComputerUseConfig> {
 	const headless = parseBoolean((source as any).headless);
 	const cursorOverlay = parseBoolean((source as any).cursor_overlay);
 	const activityGlow = parseBoolean((source as any).activity_glow);
+	const backgroundInput = parseBoolean((source as any).background_input);
+	if (backgroundInput !== undefined) out.background_input = backgroundInput;
+	const backgroundPointer = parseBoolean((source as any).background_pointer);
+	if (backgroundPointer !== undefined) out.background_pointer = backgroundPointer;
 	if (browserUse !== undefined) out.browser_use = browserUse;
 	if (headless !== undefined) out.headless = headless;
 	if (cursorOverlay !== undefined) out.cursor_overlay = cursorOverlay;
@@ -77,6 +87,10 @@ function readEnv(): Partial<ComputerUseConfig> {
 	const headless = parseBoolean(process.env.PI_COMPUTER_USE_HEADLESS);
 	const cursorOverlay = parseBoolean(process.env.PI_COMPUTER_USE_CURSOR_OVERLAY);
 	const activityGlow = parseBoolean(process.env.PI_COMPUTER_USE_ACTIVITY_GLOW);
+	const backgroundInput = parseBoolean(process.env.PI_COMPUTER_USE_BACKGROUND_INPUT);
+	if (backgroundInput !== undefined) out.background_input = backgroundInput;
+	const backgroundPointer = parseBoolean(process.env.PI_COMPUTER_USE_BACKGROUND_POINTER);
+	if (backgroundPointer !== undefined) out.background_pointer = backgroundPointer;
 	if (browserUse !== undefined) out.browser_use = browserUse;
 	if (headless !== undefined) out.headless = headless;
 	if (cursorOverlay !== undefined) out.cursor_overlay = cursorOverlay;
@@ -147,7 +161,9 @@ Example:
   "managed_browser": "chrome",
   "headless": false,
   "cursor_overlay": true,
-  "activity_glow": true
+  "activity_glow": true,
+  "background_input": true,
+  "background_pointer": false
 }
 ```
 
@@ -189,6 +205,18 @@ When `true`, macOS displays a click-through pulsing border on every screen while
 
 The activity glow appears in user screen recordings, but never in the agent's own observations: helper captures always target a single window, so screen-edge overlays are not included. The glow is excluded from accessibility discovery. Other platforms ignore this setting, and `headless: true` always suppresses it ([macOS reference](./platforms/macos/implementation.mdx#activity-glow)).
 
+### `background_input`
+
+Default: `{{config-default:background_input}}`
+
+When `true` on macOS, keyboard input that would otherwise need the foreground (`typeText`/`keypress` without a semantic target, and keys after a coordinate click) is addressed to the target window through private WindowServer (SkyLight) calls. Key focus is lent to that window for the event batch and handed back, so the user's front app and cursor stay put. Command shortcuts are run through the app's own menu item when one owns them, since key equivalents only reach the front app. The helper reports availability as `backgroundInput` in its diagnostics and falls back to the previous delivery when a symbol is missing. Approach adapted from arc-cua (MIT).
+
+### `background_pointer`
+
+Default: `{{config-default:background_pointer}}`
+
+Experimental. When `true` (with `background_input`), coordinate clicks, moves, and scrolls are also delivered to the window in the background instead of raising it and moving the cursor. Some apps ignore these events (SwiftUI controls and Finder's sidebar did on macOS 27), and a coordinate click cannot verify itself, so the default keeps pointer input in the foreground. Drags always use the real pointer.
+
 ## Environment variables
 
 ```bash
@@ -204,6 +232,8 @@ PI_COMPUTER_USE_CURSOR_OVERLAY=0
 PI_COMPUTER_USE_CURSOR_OVERLAY=1
 PI_COMPUTER_USE_ACTIVITY_GLOW=0
 PI_COMPUTER_USE_ACTIVITY_GLOW=1
+PI_COMPUTER_USE_BACKGROUND_INPUT=0
+PI_COMPUTER_USE_BACKGROUND_POINTER=1
 PI_COMPUTER_USE_DELIVERY_POLICY=default
 PI_COMPUTER_USE_DELIVERY_POLICY=foreground
 PI_COMPUTER_USE_CDP_PORT=9222

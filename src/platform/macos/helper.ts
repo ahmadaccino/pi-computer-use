@@ -261,6 +261,7 @@ export class MacosHelperClient {
 			arch: toOptionalString(result?.arch),
 			accessibility: toBoolean(result?.accessibility),
 			screenRecording: toBoolean(result?.screenRecording),
+			backgroundInput: toBoolean(result?.backgroundInput),
 		};
 		this.diagnosticsCache = diagnostics;
 		return diagnostics;

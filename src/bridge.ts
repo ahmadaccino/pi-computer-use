@@ -6,14 +6,14 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { canRetryInForeground, outcomeAfterCheck, outcomeAfterObservedValues, prepareAction, type ActionEnvironment, type ActionState, type PreparedAction } from "./actions.ts";
+import { canRetryInForeground, expandMacroActions, outcomeAfterCheck, outcomeAfterObservedValues, prepareAction, type ActionEnvironment, type ActionState, type PreparedAction } from "./actions.ts";
 import { cdpClickForContext, cdpDragForContext, cdpEvaluateForContext, cdpKeypressForContext, cdpMouseForContext, cdpNavigateContext, cdpScrollForContext, cdpSnapshotForContext, cdpTabForWindow, cdpTypeFocusedForContext, cdpTypeForContext, disconnectCdp, listCdpPageContexts, type CdpConsoleEntry, type CdpPageSnapshot } from "./cdp.ts";
 import { getComputerUseConfig, isBrowserUseEnabled, isHeadlessMode, loadComputerUseConfig } from "./config.ts";
 import { normalizeFindParams } from "./find-params.ts";
 import { noteAfterAct, noteFromLook, noteRegionKeyForRef, renderNote, type WindowNote } from "./note.ts";
 import { controlLine, foldToBudget, graftScopedOutline, isInteractiveControl, nodeByRef, resolveTextTarget, outlineNodeLabel, outlineNodePath, rankedTextMatch, renderInteractiveControls, restoreOutline, searchOutline, searchOutlineRanked, serializeOutline, serializeOutlineNodeShallow, serializeOutlineSearchMatch, type LookResponse, type Outline, type OutlineChange, type OutlineDiff, type OutlineNode, type OutlineSearchMatch, type SerializedOutline, type SerializedOutlineNode, type SerializedOutlineSearchMatch } from "./outline.ts";
 import { applyOutputEnvelope, boundToolError, clearStoredOutputs, readStoredOutput, UI_TEXT_PAGE_CHARS } from "./output.ts";
-import { AGENT_TOOL_NAMES, type ActParams, type DragEndpoint, type SuccessorObserveMode, type EvaluateBrowserParams, type ExpandUiParams, type ImageMode, type InspectUiParams, type LaunchBrowserParams, type FindParams, type NavigateBrowserParams, type ObserveDetail, type ObserveParams, type ObserveTargetParams, type ReadTextParams, type RootSelector, type SearchUiParams, type UiAction, type WaitForParams } from "./contract.ts";
+import { AGENT_TOOL_NAMES, type ActParams, type AppControlParams, type AppTargetParams, type MenuCommandsParams, type DragEndpoint, type SuccessorObserveMode, type EvaluateBrowserParams, type ExpandUiParams, type ImageMode, type InspectUiParams, type LaunchBrowserParams, type FindParams, type NavigateBrowserParams, type ObserveDetail, type ObserveParams, type ObserveTargetParams, type ReadTextParams, type RootSelector, type SearchUiParams, type UiAction, type WaitForParams } from "./contract.ts";
 import { toFiniteNumber } from "./platform/coerce.ts";
 import { currentPlatformBackend } from "./platform/index.ts";
 import type { FramePoints, HelperActPerformed, HelperActResult, NativeInputDelivery, PlatformActRequest, PlatformApp as HelperApp, PlatformDiagnostics, PlatformFrontmostResult as FrontmostResult, PlatformRoot as HelperWindow } from "./platform/types.ts";
@@ -1148,7 +1148,7 @@ async function buildToolResult(
 	return { content, details };
 }
 
-type NativePreparedAction = Exclude<PreparedAction, { action: "wait" }>;
+type NativePreparedAction = Exclude<PreparedAction, { action: "wait" } | { action: "menu" }>;
 
 function round2(value: number): string {
 	return Number.isInteger(value) ? String(value) : value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
@@ -1227,6 +1227,7 @@ async function helperAct(
 	action: NativePreparedAction,
 	headless: boolean,
 	signal?: AbortSignal,
+	freshnessGuard = false,
 ): Promise<ExecutionTrace> {
 	const checked = (candidate: HelperActResult): HelperActResult => {
 		if (!candidate || !["worked", "didnt", "unknown"].includes(candidate.outcome)) {
@@ -1236,15 +1237,18 @@ async function helperAct(
 	};
 	const textTimeout = "text" in action.params ? action.params.text.length * 25 + 4_000 : COMMAND_TIMEOUT_MS;
 	const timeoutMs = Math.max(COMMAND_TIMEOUT_MS, textTimeout);
-	if ((action.usesCurrentFocus || action.needsForeground) && !headless) {
-		const foreground = checked(await currentPlatformBackend.act(helperActRequest(target, action, "foreground"), { signal, timeoutMs }));
+	// Keyboard input into a focus established earlier in the transaction can stay
+	// in the background when window-addressed input is available.
+	const currentFocusNeedsForeground = action.usesCurrentFocus && !backgroundInputAvailable();
+	if ((currentFocusNeedsForeground || action.needsForeground) && !headless) {
+		const foreground = checked(await currentPlatformBackend.act(helperActRequest(target, action, "foreground", freshnessGuard), { signal, timeoutMs }));
 		const trace = executionTraceFromAct(foreground, "foreground");
 		trace.backgroundFirst = false;
 		return trace;
 	}
 	try {
 		const initialPolicy = headless ? "ax_only" : "background";
-		const result = checked(await currentPlatformBackend.act(helperActRequest(target, action, initialPolicy), { signal, timeoutMs }));
+		const result = checked(await currentPlatformBackend.act(helperActRequest(target, action, initialPolicy, freshnessGuard), { signal, timeoutMs }));
 		if (canRetryInForeground(action, result.outcome, headless)) {
 			const foreground = checked(await currentPlatformBackend.act(helperActRequest(target, action, "foreground"), { signal, timeoutMs }));
 			const trace = executionTraceFromAct(foreground, "foreground");
@@ -1259,6 +1263,7 @@ async function helperAct(
 		return trace;
 	} catch (error) {
 		const code = (error as Error & { code?: string })?.code;
+		if (code === "ui_changed") throw new UiChangedError(error instanceof Error ? error.message : String(error));
 		if (code !== "foreground_required" || headless) throw error;
 		const foreground = checked(await currentPlatformBackend.act(helperActRequest(target, action, "foreground"), { signal, timeoutMs }));
 		const trace = executionTraceFromAct(foreground, "foreground");
@@ -1270,10 +1275,11 @@ async function helperAct(
 	}
 }
 
-function helperActRequest(target: ResolvedTarget, action: NativePreparedAction, policy = currentDeliveryPolicy()): PlatformActRequest {
+function helperActRequest(target: ResolvedTarget, action: NativePreparedAction, policy = currentDeliveryPolicy(), freshnessGuard = false): PlatformActRequest {
 	const look = currentLookOrThrow();
 	const delivery = nativeInputDelivery(policy);
-	const base = { lookId: look.lookId, pid: target.pid, target: action.target, policy };
+	const config = getComputerUseConfig();
+	const base = { lookId: look.lookId, pid: target.pid, target: action.target, policy, skylight: config.background_input, skylightPointer: config.background_input && config.background_pointer, ...(freshnessGuard ? { freshnessGuard: true } : {}) };
 	return (() => {
 		switch (action.action) {
 			case "press":
@@ -1365,9 +1371,9 @@ async function windowDetailsForFind(query: FindParams, config: ReturnType<typeof
 	return await collectWindowDetails(apps, config, signal);
 }
 
-async function launchApp(query: FindParams, signal?: AbortSignal): Promise<string> {
+async function launchApp(query: FindParams, signal?: AbortSignal, appArgs: string[] = []): Promise<string> {
 	if (process.platform !== "darwin") throw new Error("find_roots.launch is currently supported on macOS only; start the app another way and call find_roots with waitMs.");
-	const args = query.bundleId ? ["-b", query.bundleId] : ["-a", query.app!];
+	const args = [...(query.bundleId ? ["-b", query.bundleId] : ["-a", query.app!]), ...(appArgs.length ? ["--args", ...appArgs] : [])];
 	await new Promise<void>((resolve, reject) => {
 		const child = spawn("/usr/bin/open", args, { stdio: ["ignore", "ignore", "pipe"] });
 		let stderr = "";
@@ -1377,6 +1383,123 @@ async function launchApp(query: FindParams, signal?: AbortSignal): Promise<strin
 		signal?.addEventListener("abort", () => child.kill(), { once: true });
 	});
 	return query.bundleId ?? query.app!;
+}
+
+interface MenuCommandsDetails {
+	tool: "menu_commands";
+	app: string;
+	pid: number;
+	query?: string;
+	commands: Array<{ path: string; shortcut?: string; enabled: boolean; checked?: boolean }>;
+	total: number;
+	returned: number;
+}
+
+interface AppControlDetails {
+	tool: "app_control";
+	action: AppControlParams["action"];
+	app?: string;
+	pid?: number;
+	launched?: boolean;
+	roots?: ListWindowsDetails["windows"];
+}
+
+/** Resolves the app a tool should act on: the state's root, an @r root, an app/bundle id, or the frontmost app. */
+async function resolveAppTarget(params: AppTargetParams, signal?: AbortSignal): Promise<{ pid: number; appName: string; bundleId?: string } | undefined> {
+	const state = operationState();
+	if (params.stateId && state.currentTarget) return { pid: state.currentTarget.pid, appName: state.currentTarget.appName, bundleId: state.currentTarget.bundleId };
+	if (params.root) {
+		const target = await resolveTargetByWindowSelector(params.root, signal);
+		return { pid: target.pid, appName: target.appName, bundleId: target.bundleId };
+	}
+	if (params.app || params.bundleId) {
+		const query: FindParams = { app: trimOrUndefined(params.app), bundleId: trimOrUndefined(params.bundleId) };
+		const apps = await listApps(signal);
+		const exact = apps.filter((app) => appMatchesWindowQuery(app, query));
+		const matches = exact.length ? exact : query.app ? apps.filter((app) => {
+			const match = rankedTextMatch([app.appName, app.bundleId ?? ""], query.app!);
+			return match && match.reason !== "fuzzy";
+		}) : [];
+		const app = matches[0];
+		return app ? { pid: app.pid, appName: app.appName, bundleId: app.bundleId } : undefined;
+	}
+	const front = await getFrontmost(signal);
+	return { pid: front.pid, appName: front.appName, bundleId: front.bundleId };
+}
+
+async function performMenuCommands(params: MenuCommandsParams, signal?: AbortSignal): Promise<AgentToolResult<MenuCommandsDetails>> {
+	if (!currentPlatformBackend.menuList) throw new Error("menu_commands is supported on macOS only.");
+	const app = await resolveAppTarget(params, signal);
+	if (!app) throw new Error(`No running app matches ${JSON.stringify(params.app ?? params.bundleId)}. Use app_control to launch it.`);
+	const limit = Math.max(1, Math.min(400, Math.trunc(toFiniteNumber(params.limit, 80))));
+	const query = trimOrUndefined(params.query);
+	const listed = await currentPlatformBackend.menuList({ pid: app.pid, query, limit }, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
+	const lines = listed.commands.map((command) => `${command.path}${command.shortcut ? `  (${command.shortcut})` : ""}${command.enabled ? "" : "  [disabled]"}${command.checked ? "  [checked]" : ""}`);
+	const more = listed.total > listed.returned ? ` Showing ${listed.returned}; refine query for the other ${listed.total - listed.returned}.` : "";
+	const text = listed.total === 0
+		? `${app.appName} has no menu commands${query ? ` matching ${JSON.stringify(query)}` : ""}.`
+		: `${app.appName} menu commands${query ? ` matching ${JSON.stringify(query)}` : ""}: ${listed.total}.${more} Run one with act_ui {action:"menu", command:"<path>"}; it works with the app in the background and acts on the app's key window.\n${lines.join("\n")}`;
+	return { content: [{ type: "text", text }], details: { tool: "menu_commands", app: app.appName, pid: app.pid, query, commands: listed.commands, total: listed.total, returned: listed.returned } };
+}
+
+async function runOsascript(lines: string[], signal?: AbortSignal): Promise<void> {
+	await new Promise<void>((resolve, reject) => {
+		const child = spawn("/usr/bin/osascript", lines.flatMap((line) => ["-e", line]), { stdio: ["ignore", "ignore", "pipe"] });
+		let stderr = "";
+		child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+		child.on("error", reject);
+		child.on("close", (code) => code === 0 ? resolve() : reject(new Error(stderr.trim() || `osascript exited with ${code}`)));
+		signal?.addEventListener("abort", () => child.kill(), { once: true });
+	});
+}
+
+function appleScriptTarget(app: { appName: string; bundleId?: string }): string {
+	return app.bundleId ? `application id ${JSON.stringify(app.bundleId)}` : `application ${JSON.stringify(app.appName)}`;
+}
+
+async function performAppControl(params: AppControlParams, signal?: AbortSignal): Promise<AgentToolResult<AppControlDetails>> {
+	if (process.platform !== "darwin") throw new Error("app_control is supported on macOS only.");
+	const action = params.action;
+	if (!["launch", "quit", "relaunch", "activate", "hide"].includes(action)) throw new Error("app_control.action must be launch, quit, relaunch, activate, or hide.");
+	const args = Array.isArray(params.args) ? params.args.map(String) : [];
+	if (args.length && action !== "launch" && action !== "relaunch") throw new Error("app_control.args apply to launch and relaunch only.");
+	const running = await resolveAppTarget(params, signal);
+	const named = { appName: trimOrUndefined(params.app) ?? running?.appName ?? "", bundleId: trimOrUndefined(params.bundleId) ?? running?.bundleId };
+	if (!named.appName && !named.bundleId) throw new Error("app_control requires app, bundleId, root, or stateId.");
+	const details: AppControlDetails = { tool: "app_control", action, app: running?.appName ?? named.appName, pid: running?.pid };
+	const waitGone = async (pid: number) => {
+		const deadline = Date.now() + 10_000;
+		while (Date.now() < deadline) {
+			if (!(await listApps(signal)).some((app) => app.pid === pid)) return true;
+			await sleep(200, signal);
+		}
+		return false;
+	};
+	if (action === "quit" || action === "relaunch") {
+		if (running) {
+			await runOsascript([`tell ${appleScriptTarget(named)} to quit`], signal);
+			if (!(await waitGone(running.pid))) throw new Error(`${named.appName || named.bundleId} did not quit within 10s (it may be showing a save prompt). Observe it and answer the prompt.`);
+		}
+		if (action === "quit") return { content: [{ type: "text", text: running ? `Quit ${details.app}.` : `${named.appName || named.bundleId} was not running.` }], details };
+	}
+	if (action === "activate" || action === "hide") {
+		if (!running) throw new Error(`${named.appName || named.bundleId} is not running. Use app_control launch.`);
+		await runOsascript(action === "activate"
+			? [`tell ${appleScriptTarget(named)} to activate`]
+			: [`tell application "System Events" to set visible of (first process whose unix id is ${running.pid}) to false`], signal);
+		return { content: [{ type: "text", text: `${action === "activate" ? "Activated" : "Hid"} ${details.app}.` }], details };
+	}
+	// launch / relaunch: start (with args), then wait for a window and list its roots.
+	if (action === "launch" && running && args.length) throw new Error(`${details.app} is already running; args only apply at launch. Use action "relaunch".`);
+	if (!running || action === "relaunch") {
+		await launchApp({ app: named.appName || undefined, bundleId: named.bundleId }, signal, args);
+		details.launched = true;
+	}
+	const roots = await performListWindows({ app: named.bundleId ? undefined : named.appName, bundleId: named.bundleId, waitMs: Math.max(0, Math.min(60_000, toFiniteNumber(params.waitMs, 20_000))) }, signal);
+	details.roots = roots.details.windows;
+	const first = roots.content[0];
+	const rootsText = first?.type === "text" ? first.text : "";
+	return { content: [{ type: "text", text: `${details.launched ? `${action === "relaunch" ? "Relaunched" : "Launched"} ${named.appName || named.bundleId}${args.length ? ` with ${args.join(" ")}` : ""}.` : `${details.app} is already running.`} ${rootsText}` }], details };
 }
 
 async function performListWindows(params: FindParams, signal?: AbortSignal): Promise<AgentToolResult<ListWindowsDetails>> {
@@ -1717,6 +1840,37 @@ function sameRootIdentity(a: CurrentTarget, b: CurrentTarget): boolean {
 	return normalizeText(a.windowTitle) === normalizeText(b.windowTitle);
 }
 
+/**
+ * Electron/CEF apps show page content to Accessibility only with renderer
+ * accessibility on; a near-empty outline from one of them gets a relaunch hint.
+ */
+async function chromiumAccessibilityHint(result: CaptureResult, signal?: AbortSignal): Promise<string> {
+	if (result.outline.nodes.length > 30 || currentPlatformBackend.isChromeFamilyApp(result.target.appName, result.target.bundleId)) return "";
+	const app = (await listApps(signal).catch(() => [])).find((candidate) => candidate.pid === result.target.pid);
+	if (!app?.embedsChromium) return "";
+	return `\n${result.target.appName} is built on Chromium and exposes little to Accessibility right now. Relaunch it with renderer accessibility to see its content: app_control({ action: "relaunch", app: ${JSON.stringify(result.target.appName)}, args: ["--force-renderer-accessibility"] }) (this quits the app).`;
+}
+
+/** Replaces the observation image with one that has each listed control's box and ref drawn on. */
+async function annotateObservation(result: AgentToolResult<ComputerUseDetails>, capture: CaptureResult, signal?: AbortSignal): Promise<void> {
+	const image = result.content.find((item) => item.type === "image") as { type: "image"; data: string; mimeType: string } | undefined;
+	if (!image || !currentPlatformBackend.annotateImage) return;
+	// Unlabeled controls matter most here (custom-drawn UIs), so draw every
+	// interactive node with a box, not only the ones the compact list names.
+	const boxes = capture.outline.nodes
+		.filter((node) => node !== capture.outline.root && !node.offscreen && isInteractiveControl(node) && node.rect && node.rect.w >= 4 && node.rect.h >= 4)
+		.slice(0, 120)
+		.map((node) => ({ x: node.rect!.x, y: node.rect!.y, w: node.rect!.w, h: node.rect!.h, label: node.ref }));
+	if (boxes.length === 0) return;
+	try {
+		const annotated = await currentPlatformBackend.annotateImage({ jpegBase64: image.data, boxes }, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
+		image.data = annotated.jpegBase64;
+		image.mimeType = "image/jpeg";
+	} catch {
+		// The plain screenshot is still useful; annotation is best effort.
+	}
+}
+
 /** Side effects: captures/updates current target, capture state, look, and parsed outline. */
 async function performObserve(params: ObserveParams, signal?: AbortSignal): Promise<AgentToolResult<ComputerUseDetails | BrowserObservationDetails>> {
 	const requestedRoot = typeof params.root === "string" ? params.root : undefined;
@@ -1731,8 +1885,9 @@ async function performObserve(params: ObserveParams, signal?: AbortSignal): Prom
 		return browserObservationResult(browser, resourceKey, scheduled.epoch, "observe_ui", undefined, params.detail);
 	}
 	const state = operationState();
-	const mode = params.mode ?? "fused";
-	const image = mode === "semantic" ? "never" : mode === "visual" ? "always" : "auto";
+	const mode = params.mode ?? (params.annotate ? "visual" : "fused");
+	if (params.annotate && mode === "semantic") throw new Error("observe_ui.annotate needs an image; use mode visual or fused.");
+	const image = mode === "semantic" ? "never" : mode === "visual" || params.annotate ? "always" : "auto";
 	const defaultReadText = mode === "semantic" ? "never" : mode === "visual" ? "always" : "auto";
 	const readText = params.readText ?? defaultReadText;
 	state.currentImageMode = normalizeImageMode(image);
@@ -1756,8 +1911,11 @@ async function performObserve(params: ObserveParams, signal?: AbortSignal): Prom
 			`Observation target drifted from the requested selection. Requested ${requestedTarget.appName} — ${requestedTarget.windowTitle}, captured ${captureResult.target.appName} — ${captureResult.target.windowTitle}. Call observe_ui again or specify a more exact window title.`,
 		);
 	}
-	const summary = `Observed ${mode} ${captureResult.target.windowRef ? `${captureResult.target.windowRef} ` : ""}${captureResult.target.appName} — ${captureResult.target.windowTitle}. Returned the latest outline state.`;
-	return await buildToolResult("observe_ui", summary, captureResult, executionTrace("look", "stealth"), signal, imageMode, undefined, params.detail);
+	const hint = await chromiumAccessibilityHint(captureResult, signal);
+	const summary = `Observed ${mode} ${captureResult.target.windowRef ? `${captureResult.target.windowRef} ` : ""}${captureResult.target.appName} — ${captureResult.target.windowTitle}. Returned the latest outline state.${hint}`;
+	const result = await buildToolResult("observe_ui", summary, captureResult, executionTrace("look", "stealth"), signal, imageMode, undefined, params.detail);
+	if (params.annotate) await annotateObservation(result, captureResult, signal);
+	return result;
 }
 
 function currentOutlineOrThrow(stateId?: string): Outline {
@@ -1936,7 +2094,16 @@ function actionEnvironment(look: LookResponse, headless: boolean): ActionEnviron
 		foreignEndpoint: foreignDragEndpoint,
 		supportsScreenPoints: process.platform === "darwin",
 		supportsWindowKeyboard: process.platform === "darwin",
+		supportsBackgroundInput: backgroundInputAvailable(),
+		supportsBackgroundPointer: backgroundInputAvailable() && getComputerUseConfig().background_pointer,
+		supportsMenuCommands: Boolean(currentPlatformBackend.menuPress),
 	};
+}
+
+/** True when the helper can deliver window-addressed background input and the user has not disabled it. */
+function backgroundInputAvailable(): boolean {
+	const config = getComputerUseConfig();
+	return process.platform === "darwin" && !config.headless && config.background_input && runtimeState.helperDiagnostics?.backgroundInput === true;
 }
 
 function prepareUiAction(action: UiAction, state: ActionState, look: LookResponse, headless: boolean): PreparedAction {
@@ -1961,13 +2128,24 @@ function preflightUiTransaction(actions: UiAction[], look: LookResponse, headles
 	}
 }
 
-async function dispatchUiAction(action: UiAction, target: ResolvedTarget, look: LookResponse, headless: boolean, state: ActionState, signal?: AbortSignal): Promise<ExecutionTrace> {
+/** The helper refused to act because the UI changed structurally since the look; nothing was sent. */
+class UiChangedError extends Error {
+	readonly code = "ui_changed";
+}
+
+async function dispatchUiAction(action: UiAction, target: ResolvedTarget, look: LookResponse, headless: boolean, state: ActionState, signal?: AbortSignal, freshnessGuard = false): Promise<ExecutionTrace> {
 	const prepared = prepareUiAction(action, state, look, headless);
 	if (prepared.action === "wait") {
 		await sleep(prepared.params.ms, signal);
 		return executionTrace("wait", "stealth", { outcome: "worked" });
 	}
-	const trace = await helperAct(target, prepared, headless, signal);
+	if (prepared.action === "menu") {
+		const pressed = await currentPlatformBackend.menuPress!({ pid: target.pid, path: prepared.params.command }, { signal, timeoutMs: COMMAND_TIMEOUT_MS });
+		const trace = executionTrace("act", "stealth", { outcome: "worked" });
+		trace.performed = { delivery: "ax", grounding: "description", menuCommand: pressed.path } as unknown as HelperActPerformed;
+		return trace;
+	}
+	const trace = await helperAct(target, prepared, headless, signal, freshnessGuard);
 	if (!headless && (prepared.establishesFocus || (prepared.action === "click" && "x" in prepared.target))) {
 		state.currentFocus = true;
 	}
@@ -1978,9 +2156,9 @@ async function dispatchUiTransaction(actions: UiAction[], target: ResolvedTarget
 	// Strict-headless batches have one immutable delivery class. When foreground
 	// fallback is permitted, decide independently per action so a completed
 	// background prefix is never replayed as part of a foreground batch.
-	if (headless && currentPlatformBackend.actBatch && !actions.some((action) => action.action === "wait")) {
+	if (headless && currentPlatformBackend.actBatch && !actions.some((action) => action.action === "wait" || action.action === "menu")) {
 		const actionState: ActionState = { currentFocus: false };
-		const requests = actions.map((action) => helperActRequest(target, prepareUiAction(action, actionState, look, true) as NativePreparedAction, "ax_only"));
+		const requests = actions.map((action, index) => helperActRequest(target, prepareUiAction(action, actionState, look, true) as NativePreparedAction, "ax_only", index === 0));
 		const textLength = actions.reduce((sum, action) => sum + (action.text?.length ?? 0), 0);
 		const result = await currentPlatformBackend.actBatch(requests, { signal, timeoutMs: Math.max(COMMAND_TIMEOUT_MS, textLength * 25 + 6_000) });
 		if (!result.steps || result.steps.length === 0) throw new Error("Native action transaction returned no checked steps.");
@@ -1994,8 +2172,10 @@ async function dispatchUiTransaction(actions: UiAction[], target: ResolvedTarget
 	}
 	const steps: ExecutionTrace[] = [];
 	const actionState: ActionState = { currentFocus: false };
-	for (const action of actions) {
-		const step = await dispatchUiAction(action, target, look, headless, actionState, signal);
+	for (const [index, action] of actions.entries()) {
+		// Only the first step is checked against the look: later steps act on the
+		// UI that earlier steps of this transaction intentionally changed.
+		const step = await dispatchUiAction(action, target, look, headless, actionState, signal, index === 0 && actions[0].action !== "wait");
 		steps.push(step);
 		if (step.outcome === "didnt") break;
 	}
@@ -2141,7 +2321,19 @@ async function performDesktopTransaction(params: ActParams, actions: UiAction[],
 	const noteBefore = state.currentNote;
 	return await withWindowWriteLock(target, async () => {
 		const headless = getComputerUseConfig().headless;
-		const execution = await dispatchUiTransaction(actions, target, look, headless, signal);
+		let execution: ExecutionTrace;
+		try {
+			execution = await dispatchUiTransaction(actions, target, look, headless, signal);
+		} catch (error) {
+			const code = (error as { code?: string })?.code;
+			if (code !== "ui_changed") throw error;
+			// Refused before anything was sent: hand back what is on screen now.
+			const refused = executionTrace("act", "stealth", { outcome: "didnt", actionCount: 0 });
+			refused.error = { code: "ui_changed", message: error instanceof Error ? error.message : String(error) };
+			state.currentImageMode = observe.imageMode;
+			const capture = await captureCurrentTarget(signal, observe.readText, observe.maxDimension, target, observe.imageMode !== "never");
+			return await buildToolResult("act_ui", `Not executed: ${refused.error.message}. Decide again on the fresh state ${capture.capture.stateId} below.`, capture, refused, signal, state.currentImageMode, baseView);
+		}
 		const executedActions = actions.slice(0, execution.actionCount ?? actions.length);
 		try {
 			if (condition) {
@@ -2286,7 +2478,7 @@ function validateActionTarget(action: UiAction): void {
 }
 
 async function performAct(params: ActParams, signal?: AbortSignal): Promise<AgentToolResult<ComputerUseDetails | TerminalDesktopActionDetails | BrowserObservationDetails>> {
-	const actions = Array.isArray(params.actions) ? params.actions : [];
+	const actions = expandMacroActions(Array.isArray(params.actions) ? params.actions : []);
 	if (actions.length === 0) throw new Error("act_ui.actions must contain at least one action.");
 	if (actions.length > 20) throw new Error("act_ui supports at most 20 actions per transaction.");
 	for (const action of actions) validateActionTarget(action);
@@ -2514,6 +2706,8 @@ function makeToolExecutor<P, D>(tool: string, perform: (params: P, signal?: Abor
 }
 
 export const executeFind = makeToolExecutor("find_roots", performListWindows);
+export const executeMenuCommands = makeToolExecutor("menu_commands", performMenuCommands);
+export const executeAppControl = makeToolExecutor("app_control", performAppControl);
 export const executeReadText = makeToolExecutor("read_text", performReadText);
 export const executeWaitFor = makeToolExecutor("wait_for", performWaitFor);
 export const executeObserve = makeToolExecutor("observe_ui", performObserve);
@@ -2794,6 +2988,24 @@ act_ui({
 Drags use physical input. The helper presses and holds (`holdMs`, default 250), travels through interpolated points, and hovers over the target (`dwellMs`, default 400) so OS drag sessions start and drop targets can accept. A covered drop root is raised first, and a drop that would land on a different app fails with `occluded_target` before anything is pressed.
 
 Validation (unknown refs, out-of-image points, ambiguous text) happens before a transaction is scheduled, so a rejected `act_ui` never invalidates other states. If a state is stale anyway, the error names the latest state for that root.
+
+### Checked when it acts
+
+The first step of a desktop transaction is checked against the app as it is when the step runs, not only as it was observed. If a window, sheet, or menu opened or closed, or focus moved to another window, since the state was captured, the helper sends nothing; `act_ui` returns `Not executed` with `error.code: "ui_changed"` and a fresh state to decide on. Later steps of the same transaction are not checked, because they act on changes the earlier steps made deliberately.
+
+### Menus, dialogs, and apps
+
+`menu_commands({ app: "Finder", query: "folder" })` reads the menu bar as commands (path, shortcut, enabled, checked) without opening a menu. Run one with `act_ui({ stateId, actions: [{ action: "menu", command: "File > New Folder" }] })`; it presses the item through Accessibility, so the app can stay in the background. Menu commands act on the app's key window.
+
+`{ action: "choosePath", location: "~/Music", confirm: true }` drives an open Open/Save panel through Go to Folder in one step.
+
+`app_control` launches, quits, relaunches (with `args`), activates, or hides an app; launch and relaunch wait for a window and return its roots. Electron and CEF apps expose page content only with renderer accessibility; when such an app observes nearly empty, `observe_ui` suggests `app_control({ action: "relaunch", app, args: ["--force-renderer-accessibility"] })`.
+
+`observe_ui({ root, annotate: true })` draws every interactive control's box and `@e` ref onto the screenshot, which makes unlabeled, custom-drawn controls addressable.
+
+### Background input
+
+With `background_input` (the macOS default), keyboard input without a semantic target is addressed to the target window through SkyLight with key focus lent only for the event batch, so the user's front app and cursor are untouched; Command shortcuts go through the owning menu item. Background coordinate clicks are opt-in (`background_pointer`) because some apps ignore them. Successor settling follows the app's Accessibility notifications: an idle app settles in about 0.15 s, a reacting one 0.1 s after it goes quiet, within the previous 0.4 s bound.
 
 ## Bounded output
 

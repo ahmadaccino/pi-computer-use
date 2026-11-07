@@ -41,6 +41,7 @@ Use the smallest check that proves the change:
 - TypeScript or schema changes: run `npm test`; if the public tool definition changed, run `npm run docs:generate` first.
 - Native helper changes: run `npm run build:native` and `npm test`.
 - Behavior changes: run `cubench` against the registered extension tools.
+- macOS driver latency and background delivery: run `npm run bench:macos -- --runs 7 --out bench.json` on a machine you are not using; it drives Calculator and Finder and fails if background keyboard input changes the front app.
 
 The in-repo legacy benchmark harness was removed because it targeted old direct action tools. Use `cubench` for behavioral validation.
 

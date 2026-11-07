@@ -46,6 +46,7 @@ Primary UI observation tool. Follow with search_ui, expand_ui, inspect_ui, or ac
 | `root` | `string` | no | Exact @r ref issued by find_roots |
 | `mode` | `semantic` \| `visual` \| `fused` | no | Observation mode, default fused |
 | `detail` | `compact` \| `outline` | no | compact (default) lists actionable refs; outline returns the folded tree |
+| `annotate` | `boolean` | no | Draw each listed control's box and @e ref onto the screenshot (implies an image) |
 
 ## `search_ui`
 
@@ -141,6 +142,8 @@ Pass dependent click/type/wait steps together in one call, use expect for observ
 | `moveMouse` | `x`: `number` (required); `y`: `number` (required); `space`: `image` \| `screen` (optional) |
 | `moveMouse` | `text`: `string` (required) |
 | `wait` | `ms`: `number` (required) minimum: `0`, maximum: `10000`. |
+| `menu` | `command`: `string` (required) |
+| `choosePath` | `location`: `string` (required); `confirm`: `boolean` (optional) |
 
 ## `read_text`
 
@@ -225,6 +228,47 @@ Prefer observe/search/read; return selected fields, aggregates, or bounded slice
 | --- | --- | --- | --- |
 | `stateId` | `string` | yes | Required state id owning every @e ref used by this operation |
 | `expression` | `string` | yes | — |
+
+## `menu_commands`
+
+List an app's menu-bar commands (path, shortcut, enabled, checked) without opening any menu. Defaults to the frontmost app.
+
+### agent guidance
+
+Find a menu command, then run it with act_ui {action:"menu", command}; often one step instead of a click-through.
+
+### parameters
+
+| parameter | type | required | description and constraints |
+| --- | --- | --- | --- |
+| `stateId` | `string` | no | State whose app is the target |
+| `root` | `string` | no | Exact @r root ref; its app is the target |
+| `app` | `string` | no | App name |
+| `bundleId` | `string` | no | Bundle id |
+| `query` | `string` | no | Words that must all appear in the path or shortcut |
+| `limit` | `number` | no | Default 80 minimum: `1`, maximum: `400`. |
+
+## `app_control`
+
+Launch, quit, relaunch (with command-line args), activate, or hide an app; launch/relaunch waits for its window and returns its roots.
+
+### agent guidance
+
+Manage app lifecycle instead of shelling out; relaunch Electron/CEF apps with --force-renderer-accessibility when observe_ui suggests it.
+
+- Quit and relaunch close the app's windows; save or confirm with the user first.
+
+### parameters
+
+| parameter | type | required | description and constraints |
+| --- | --- | --- | --- |
+| `stateId` | `string` | no | State whose app is the target |
+| `root` | `string` | no | Exact @r root ref; its app is the target |
+| `app` | `string` | no | App name |
+| `bundleId` | `string` | no | Bundle id |
+| `action` | `launch` \| `quit` \| `relaunch` \| `activate` \| `hide` | yes | — |
+| `args` | array of `string` | no | Command-line arguments for launch/relaunch maxItems: `16`. |
+| `waitMs` | `number` | no | Wait for a window after launch, default 20000 minimum: `0`, maximum: `60000`. |
 
 <details className="reference-provenance">
   <summary>source provenance</summary>

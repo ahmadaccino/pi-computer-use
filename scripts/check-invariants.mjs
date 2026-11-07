@@ -180,7 +180,7 @@ check("INV-10 resource-keyed scheduling", () => {
 check("INV-11 unified agent contract", () => {
 	const extension = fs.readFileSync(path.join(root, "extensions/computer-use.ts"), "utf8");
 	const tools = [...extension.matchAll(/\bname:\s*"([^"]+)"/g)].map((match) => match[1]);
-	const expected = ["find_roots", "observe_ui", "search_ui", "expand_ui", "inspect_ui", "act_ui", "read_text", "wait_for", "launch_browser", "navigate_browser", "evaluate_browser"];
+	const expected = ["find_roots", "observe_ui", "search_ui", "expand_ui", "inspect_ui", "act_ui", "read_text", "wait_for", "launch_browser", "navigate_browser", "evaluate_browser", "menu_commands", "app_control"];
 	assert(JSON.stringify(tools) === JSON.stringify(expected), `unexpected public tool surface: ${tools.join(", ")}`);
 	assert(!extension.includes('executionMode: "sequential"'), "computer-use tools remain globally sequential");
 	assert(extension.includes("Required state id owning every @e ref"), "state-scoped ref contract is missing");
@@ -313,6 +313,7 @@ check("INV-8 swift typecheck", () => {
 		"native/macos/agent_cursor.swift",
 		"native/macos/agent_cursor_motion.swift",
 		"native/macos/bridge.swift",
+		"native/macos/skylight_input.swift",
 	], { cwd: root, stdio: "pipe" });
 });
 

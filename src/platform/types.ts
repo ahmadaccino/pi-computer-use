@@ -27,6 +27,8 @@ export interface PlatformDiagnostics {
 	arch?: string;
 	accessibility?: boolean;
 	screenRecording?: boolean;
+	/** macOS: window-addressed background input (SkyLight) is available. */
+	backgroundInput?: boolean;
 }
 
 export interface PlatformReadyState {
@@ -45,6 +47,8 @@ export interface PlatformApp {
 	bundleId?: string;
 	pid: number;
 	isFrontmost?: boolean;
+	/** Electron/CEF app: page content reaches Accessibility only with renderer accessibility on. */
+	embedsChromium?: boolean;
 }
 
 export interface FramePoints {
@@ -202,6 +206,20 @@ export interface PlatformWaitForRequest extends PlatformTarget {
 	timeoutMs: number;
 }
 
+export interface PlatformMenuCommand {
+	path: string;
+	shortcut?: string;
+	enabled: boolean;
+	checked?: boolean;
+}
+
+export interface PlatformMenuListResponse {
+	commands: PlatformMenuCommand[];
+	total: number;
+	returned: number;
+	elapsedMs?: number;
+}
+
 export interface PlatformWaitForResponse {
 	found: boolean;
 	gone?: boolean;
@@ -225,6 +243,12 @@ export interface ComputerUsePlatformBackend {
 	actBatch?(requests: PlatformActRequest[], options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<HelperActResult>;
 	readText(args: PlatformReadTextRequest, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<PlatformReadTextResponse>;
 	waitFor(args: PlatformWaitForRequest, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<PlatformWaitForResponse>;
+	/** The app's menu bar as commands, read without opening menus. */
+	menuList?(request: { pid: number; query?: string; limit?: number }, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<PlatformMenuListResponse>;
+	/** Press one menu command by path ("File > New Folder"), with the app in the background. */
+	menuPress?(request: { pid: number; path: string }, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ path: string; enabled: boolean }>;
+	/** Draw labelled boxes (image-pixel rects) onto a JPEG. */
+	annotateImage?(request: { jpegBase64: string; boxes: Array<{ x: number; y: number; w: number; h: number; label: string }> }, options?: { timeoutMs?: number; signal?: AbortSignal }): Promise<{ jpegBase64: string; width: number; height: number }>;
 	isBrowserApp(appName: string, bundleId?: string): boolean;
 	isChromeFamilyApp(appName: string, bundleId?: string): boolean;
 	openBrowserLocation(target: { appName: string; bundleId?: string }, url: string, signal?: AbortSignal): Promise<boolean>;

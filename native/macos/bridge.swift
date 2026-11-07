@@ -130,6 +130,9 @@ private struct LookRecord {
 	let imageWidth: Int
 	let imageHeight: Int
 	let hasImage: Bool
+	/// Root-event journal position when the look was taken; nil when the app's
+	/// notifications were not being observed.
+	var eventCursor: UInt64? = nil
 }
 
 private struct RootAXEvent {
@@ -682,6 +685,14 @@ final class Bridge {
 			return try axReadText(request)
 		case "getMousePosition":
 			return getMousePosition()
+		case "menuList":
+			return try menuList(request)
+		case "menuPress":
+			let pid = Int32(try intArg(request, "pid"))
+			guard NSRunningApplication(processIdentifier: pid) != nil else { throw BridgeFailure(message: "App \(pid) is not running", code: "target_unavailable") }
+			return try menuPress(pid: pid, path: try stringArg(request, "path"))
+		case "annotateImage":
+			return try annotateImage(request)
 		default:
 			throw BridgeFailure(message: "Unknown command '\(cmd)'", code: "unknown_command")
 		}
@@ -795,6 +806,7 @@ final class Bridge {
 			"accessibility": permissions["accessibility"] ?? false,
 			"screenRecording": permissions["screenRecording"] ?? false,
 			"activityGlowActive": activityGlow.isActive,
+			"backgroundInput": SkyLightInput.shared.isAvailable,
 			"recentCompletedRequestIds": completedRequestIds(),
 		]
 		if let parentPath {
@@ -968,6 +980,14 @@ final class Bridge {
 			]
 			if let bundleId = app.bundleIdentifier {
 				data["bundleId"] = bundleId
+			}
+			// Chromium-based apps (Electron, CEF) expose page content to AX only
+			// when renderer accessibility is on.
+			if let bundleURL = app.bundleURL {
+				let frameworks = bundleURL.appendingPathComponent("Contents/Frameworks")
+				if ["Electron Framework.framework", "Chromium Embedded Framework.framework"].contains(where: { FileManager.default.fileExists(atPath: frameworks.appendingPathComponent($0).path) }) {
+					data["embedsChromium"] = true
+				}
 			}
 			return data
 		}
@@ -1428,6 +1448,9 @@ final class Bridge {
 			imagePayload = nil
 			transform = rectTransform(windowFrame: rootFrame, imageWidth: imageWidth, imageHeight: imageHeight)
 		}
+		// Journal position before the walk: a structural change during or after it
+		// makes acting on this look unsafe.
+		let lookEventCursor: UInt64? = ensureRootObserver(pid: pid) ? rootEventCursor(pid: pid) : nil
 		let describeStart = Date()
 		let outline = buildLookOutline(root: rootElement, transform: transform)
 		let describeMs = elapsedMs(describeStart)
@@ -1451,7 +1474,8 @@ final class Bridge {
 			windowFrame: baseRecord?.windowFrame ?? capture?.frame ?? rootFrame,
 			imageWidth: baseRecord?.imageWidth ?? imageWidth,
 			imageHeight: baseRecord?.imageHeight ?? imageHeight,
-			hasImage: baseRecord?.hasImage ?? (capture != nil)
+			hasImage: baseRecord?.hasImage ?? (capture != nil),
+			eventCursor: lookEventCursor
 		))
 		let scale = (capture?.frame.width ?? rootFrame.width) > 0 ? Double(imageWidth) / (capture?.frame.width ?? rootFrame.width) : displayScaleFactor(for: rootFrame)
 		let pairing = pairingForWindow(window, pid: pid)
@@ -1911,6 +1935,12 @@ final class Bridge {
 		let policy = optionalStringArg(request, "policy") ?? "default"
 		let deferRootDelta = boolArg(request, "deferRootDelta") ?? false
 		let delivery = policy == "background" ? "pid" : ((params["delivery"] as? String) == "pid" ? "pid" : "hid")
+		// Window-addressed SkyLight input: real background delivery that apps
+		// accept where postToPid is ignored. Falls back to postToPid when missing.
+		let skylight = delivery == "pid" && policy != "ax_only" && (request["skylight"] as? Bool ?? true) && record.windowId > 0 && SkyLightInput.shared.isAvailable
+		// Pointer events through SkyLight are ignored by some apps (SwiftUI controls,
+		// Finder's sidebar on macOS 27), so they are opt-in; keyboard input is reliable.
+		let skylightPointer = skylight && (request["skylightPointer"] as? Bool ?? false)
 		var holdsPhysicalInput = false
 		func acquirePhysicalInputIfNeeded() {
 			if delivery == "hid" && !holdsPhysicalInput {
@@ -1928,6 +1958,16 @@ final class Bridge {
 		var preflightCapsUnknown = false
 		let eventsLive = !deferRootDelta && ensureRootObserver(pid: pid)
 		let eventCursor = eventsLive ? rootEventCursor(pid: pid) : 0
+		// Checked when it acts, not only when it looked: if a window, sheet, or menu
+		// appeared (or focus moved to another window) since the look, refuse before
+		// sending anything. The caller re-observes and decides on what is there now.
+		if boolArg(request, "freshnessGuard") == true, let since = record.eventCursor {
+			let structural: Set<String> = ["AXWindowCreated", "AXSheetCreated", "AXMenuOpened", "AXMenuClosed", "AXFocusedWindowChanged"]
+			if let change = rootEvents(pid: pid, since: since).first(where: { structural.contains($0.notification) }) {
+				let names = ["AXWindowCreated": "a window opened", "AXSheetCreated": "a sheet opened", "AXMenuOpened": "a menu opened", "AXMenuClosed": "a menu closed", "AXFocusedWindowChanged": "focus moved to another window"]
+				throw BridgeFailure(message: "The UI changed since this state was observed (\(names[change.notification] ?? change.notification)); nothing was sent", code: "ui_changed")
+			}
+		}
 		let beforeRootSnapshot = deferRootDelta ? [:] : rootMetadataSnapshot(pid: pid)
 		let beforeCgSignature = deferRootDelta ? [] : cgRootSignature(pid: pid)
 		let beforeFrontmostPid = deferRootDelta ? nil : NSWorkspace.shared.frontmostApplication?.processIdentifier
@@ -2040,16 +2080,24 @@ final class Bridge {
 			acquirePhysicalInputIfNeeded()
 			focusTargetForPhysicalInput()
 			if delivery == "hid" { try preflight(point) }
+			if skylightPointer { performed["delivery"] = "skylight" }
 			switch action {
 			case "press", "click":
 				animateCursor(at: point)
-				try postMouseClick(at: point, pid: pid, button: mouseButton(params["button"] as? String ?? "left"), clickCount: max(1, min(3, (params["clickCount"] as? NSNumber)?.intValue ?? 1)), delivery: delivery)
+				let button = mouseButton(params["button"] as? String ?? "left")
+				let clicks = max(1, min(3, (params["clickCount"] as? NSNumber)?.intValue ?? 1))
+				if skylightPointer {
+					try SkyLightInput.shared.click(pid: pid, window: record.windowId, windowOrigin: record.windowFrame.origin, at: point, button: button, clickCount: clicks, keyWindow: frontWindowId)
+				} else {
+					try postMouseClick(at: point, pid: pid, button: button, clickCount: clicks, delivery: delivery)
+				}
 			case "moveMouse":
 				animateCursor(at: point)
-				try postMouseMove(to: point, pid: pid, delivery: delivery)
+				if skylightPointer { try SkyLightInput.shared.move(pid: pid, window: record.windowId, windowOrigin: record.windowFrame.origin, to: point) } else { try postMouseMove(to: point, pid: pid, delivery: delivery) }
 			case "scroll":
 				animateCursor(at: point)
-				try postScrollWheel(at: point, deltaX: (params["scrollX"] as? NSNumber)?.intValue ?? 0, deltaY: (params["scrollY"] as? NSNumber)?.intValue ?? 0, pid: pid, delivery: delivery)
+				let dx = (params["scrollX"] as? NSNumber)?.intValue ?? 0, dy = (params["scrollY"] as? NSNumber)?.intValue ?? 0
+				if skylightPointer { try SkyLightInput.shared.scroll(pid: pid, window: record.windowId, windowOrigin: record.windowFrame.origin, at: point, deltaX: dx, deltaY: dy) } else { try postScrollWheel(at: point, deltaX: dx, deltaY: dy, pid: pid, delivery: delivery) }
 			case "drag":
 				guard let rawPath = params["path"] as? [[String: Any]], rawPath.count >= 2 else {
 					throw BridgeFailure(message: "drag requires path", code: "invalid_args")
@@ -2202,7 +2250,14 @@ final class Bridge {
 			acquirePhysicalInputIfNeeded()
 			if delivery == "hid" && !preserveFocus { focusTargetForPhysicalInput() }
 			let text = params["text"] as? String ?? ""
-			try postUnicodeText(text, pid: pid, delivery: delivery)
+			if skylight {
+				performed["delivery"] = "skylight"
+				try SkyLightInput.shared.withBorrowedFocus(pid: pid, window: record.windowId, keyWindow: frontWindowId) {
+					try postUnicodeText(text, pid: pid, delivery: "sky")
+				}
+			} else {
+				try postUnicodeText(text, pid: pid, delivery: delivery)
+			}
 			performed["grounding"] = "coordinates"
 			if let element, !text.isEmpty {
 				usleep(30_000)
@@ -2235,7 +2290,20 @@ final class Bridge {
 			}
 			acquirePhysicalInputIfNeeded()
 			if delivery == "hid" && !preserveFocus { focusTargetForPhysicalInput() }
-			try postKeyPress(keys: keys, pid: pid, delivery: delivery)
+			if skylight, let menuPath = pressMenuShortcut(pid: pid, keys: keys) {
+				// Key equivalents only reach the front app; the owning menu item does not.
+				performed["delivery"] = "ax"
+				performed["grounding"] = "menu_shortcut"
+				performed["menuCommand"] = menuPath
+				return finish(["outcome": "worked", "performed": performed])
+			} else if skylight {
+				performed["delivery"] = "skylight"
+				try SkyLightInput.shared.withBorrowedFocus(pid: pid, window: record.windowId, keyWindow: frontWindowId) {
+					try postKeyPress(keys: keys, pid: pid, delivery: "sky")
+				}
+			} else {
+				try postKeyPress(keys: keys, pid: pid, delivery: delivery)
+			}
 			performed["grounding"] = "coordinates"
 		} else if let element, action == "scroll" {
 			let cursorPoint = try? coordinatePoint()
@@ -2380,16 +2448,30 @@ final class Bridge {
 		// rebuilt list row; a genuinely closed root also leaves the CG set.
 		let signalNotifications: Set<String> = ["AXWindowCreated", "AXSheetCreated", "AXMenuOpened", "AXMenuClosed", "AXFocusedWindowChanged"]
 		var source = "snapshot"
-		let deadline = Date().addingTimeInterval(0.40)
+		let started = Date()
+		let deadline = started.addingTimeInterval(0.40)
+		// Adaptive settle: the app's own AX notifications say when it reacted and
+		// when it went quiet, so an idle app costs ~0.15 s instead of the full window.
+		// A structure change arriving later is still caught by the next action's
+		// freshness guard.
+		var lastGeneration = rootChangeGeneration(pid: pid)
+		var lastChange: Date?
 		while Date() < deadline {
 			if cgRootSignature(pid: pid) != beforeCgSignature { source = "cg-poll"; break }
 			if let beforeFrontmostPid, NSWorkspace.shared.frontmostApplication?.processIdentifier != beforeFrontmostPid { source = "cg-poll"; break }
 			if eventsLive && rootEvents(pid: pid, since: eventCursor).contains(where: { signalNotifications.contains($0.notification) }) { source = "events"; break }
-			usleep(30_000)
+			if eventsLive {
+				let generation = rootChangeGeneration(pid: pid)
+				if generation != lastGeneration { lastGeneration = generation; lastChange = Date() }
+				let now = Date()
+				if let lastChange, now.timeIntervalSince(lastChange) >= 0.10 { source = "settled"; break }
+				if lastChange == nil && now.timeIntervalSince(started) >= 0.15 { source = "quiet"; break }
+			}
+			usleep(20_000)
 		}
 
 		var delta = rootDelta(before: before, beforeFrontmostPid: beforeFrontmostPid, pid: pid)
-		if delta.isEmpty && source != "snapshot" {
+		if delta.isEmpty && (source == "cg-poll" || source == "events") {
 			// A signal fired but the AX tree can lag the CG window; give it a
 			// bounded moment to catch up.
 			for _ in 0..<3 where delta.isEmpty {
@@ -3420,7 +3502,21 @@ final class Bridge {
 		optionalStringArg(request, "delivery") == "pid" ? "pid" : "hid"
 	}
 
+	/// Frontmost normal window of `pid`, for handing key focus back after borrowing it.
+	private func frontWindowId(_ pid: Int32) -> UInt32? {
+		guard let entries = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else { return nil }
+		for entry in entries {
+			guard (entry[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid, ((entry[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0) == 0 else { continue }
+			return (entry[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+		}
+		return nil
+	}
+
 	private func postEvent(_ event: CGEvent, pid: Int32, delivery: String = "hid") {
+		if delivery == "sky" {
+			SkyLightInput.shared.postKey(event, pid: pid)
+			return
+		}
 		if delivery == "pid" {
 			event.postToPid(pid)
 			return
@@ -3746,6 +3842,184 @@ final class Bridge {
 		}
 	}
 
+}
+
+// MARK: - Menu commands, background shortcuts, and annotated images
+
+extension Bridge {
+	fileprivate struct MenuEntry {
+		let element: AXUIElement
+		let path: [String]
+		let shortcut: String?
+		let enabled: Bool
+		let checked: Bool
+		let hasSubmenu: Bool
+	}
+
+	/// AXMenuItemCmdModifiers: shift 1, option 2, control 4, "no command" 8.
+	fileprivate func menuShortcut(char: String?, modifiers: Int?, virtualKey: Int?) -> String? {
+		let raw = (char ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+		guard !raw.isEmpty || virtualKey != nil else { return nil }
+		let mods = modifiers ?? 0
+		var parts: [String] = []
+		if mods & 4 != 0 { parts.append("ctrl") }
+		if mods & 2 != 0 { parts.append("alt") }
+		if mods & 1 != 0 { parts.append("shift") }
+		if mods & 8 == 0 { parts.append("cmd") }
+		let named: [String: String] = ["\r": "return", "\u{1b}": "escape", "\u{7f}": "delete", "\t": "tab", " ": "space", "\u{8}": "delete"]
+		let key = named[raw] ?? raw.lowercased()
+		guard !key.isEmpty else { return nil }
+		parts.append(key)
+		return parts.joined(separator: "+")
+	}
+
+	fileprivate func menuEntries(pid: Int32, maxItems: Int = 1_500) -> [MenuEntry] {
+		let app = AXUIElementCreateApplication(pid)
+		AXUIElementSetMessagingTimeout(app, 0.5)
+		guard let bar = copyAttribute(app, attribute: kAXMenuBarAttribute as CFString).flatMap(asAXElement) else { return [] }
+		var entries: [MenuEntry] = []
+		func walk(_ menu: AXUIElement, path: [String], depth: Int) {
+			guard depth <= 4, entries.count < maxItems else { return }
+			for item in axElementArray(menu, attribute: kAXChildrenAttribute as CFString) {
+				guard entries.count < maxItems else { return }
+				let title = (stringAttribute(item, attribute: kAXTitleAttribute as CFString) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+				let submenus = axElementArray(item, attribute: kAXChildrenAttribute as CFString).filter { (stringAttribute($0, attribute: kAXRoleAttribute as CFString) ?? "") == "AXMenu" }
+				if title.isEmpty { continue }
+				let itemPath = path + [title]
+				let mark = stringAttribute(item, attribute: "AXMenuItemMarkChar" as CFString) ?? ""
+				let modifiers = (copyAttribute(item, attribute: "AXMenuItemCmdModifiers" as CFString) as? NSNumber)?.intValue
+				let virtualKey = (copyAttribute(item, attribute: "AXMenuItemCmdVirtualKey" as CFString) as? NSNumber)?.intValue
+				let shortcut = menuShortcut(char: stringAttribute(item, attribute: "AXMenuItemCmdChar" as CFString), modifiers: modifiers, virtualKey: virtualKey)
+				entries.append(MenuEntry(element: item, path: itemPath, shortcut: shortcut, enabled: boolAttribute(item, attribute: kAXEnabledAttribute as CFString) ?? true, checked: !mark.isEmpty, hasSubmenu: !submenus.isEmpty))
+				for submenu in submenus { walk(submenu, path: itemPath, depth: depth + 1) }
+			}
+		}
+		// Skip the Apple menu: it belongs to the system, not the app.
+		for (index, top) in axElementArray(bar, attribute: kAXChildrenAttribute as CFString).enumerated() where index > 0 {
+			let title = (stringAttribute(top, attribute: kAXTitleAttribute as CFString) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+			guard !title.isEmpty else { continue }
+			for menu in axElementArray(top, attribute: kAXChildrenAttribute as CFString) { walk(menu, path: [title], depth: 1) }
+		}
+		return entries
+	}
+
+	fileprivate func normalizedMenuTitle(_ value: String) -> String {
+		value.replacingOccurrences(of: "…", with: "...").lowercased().components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ").trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+	}
+
+	func menuList(_ request: [String: Any]) throws -> [String: Any] {
+		let pid = Int32(try intArg(request, "pid"))
+		guard NSRunningApplication(processIdentifier: pid) != nil else { throw BridgeFailure(message: "App \(pid) is not running", code: "target_unavailable") }
+		let query = (optionalStringArg(request, "query") ?? "").lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+		let limit = max(1, min(400, optionalIntArg(request, "limit") ?? 120))
+		let started = Date()
+		let all = menuEntries(pid: pid).filter { !$0.hasSubmenu }
+		let matched = query.isEmpty ? all : all.filter { entry in
+			let haystack = (entry.path.joined(separator: " > ") + " " + (entry.shortcut ?? "")).lowercased()
+			return query.split(separator: " ").allSatisfy { haystack.contains($0) }
+		}
+		let commands: [[String: Any]] = matched.prefix(limit).map { entry in
+			var item: [String: Any] = ["path": entry.path.joined(separator: " > "), "enabled": entry.enabled]
+			if let shortcut = entry.shortcut { item["shortcut"] = shortcut }
+			if entry.checked { item["checked"] = true }
+			return item
+		}
+		return ["commands": commands, "total": matched.count, "returned": commands.count, "elapsedMs": Int(Date().timeIntervalSince(started) * 1000)]
+	}
+
+	/// Resolves "File > Import…" (case-, ellipsis-, and whitespace-insensitive);
+	/// a bare leaf title is accepted when it is unique.
+	fileprivate func resolveMenuEntry(pid: Int32, path: String) throws -> MenuEntry {
+		let wanted = path.split(separator: ">").map { normalizedMenuTitle(String($0)) }.filter { !$0.isEmpty }
+		guard !wanted.isEmpty else { throw BridgeFailure(message: "Menu path is empty", code: "invalid_args") }
+		let entries = menuEntries(pid: pid).filter { !$0.hasSubmenu }
+		let exact = entries.filter { $0.path.map(normalizedMenuTitle) == wanted }
+		if let entry = exact.first { return entry }
+		let suffix = entries.filter { entry in
+			let titles = entry.path.map(normalizedMenuTitle)
+			return titles.count >= wanted.count && Array(titles.suffix(wanted.count)) == wanted
+		}
+		if suffix.count == 1 { return suffix[0] }
+		if suffix.count > 1 {
+			let options = suffix.prefix(6).map { $0.path.joined(separator: " > ") }.joined(separator: "; ")
+			throw BridgeFailure(message: "Menu path '\(path)' is ambiguous: \(options)", code: "command_ambiguous")
+		}
+		throw BridgeFailure(message: "The app's menu bar has no command '\(path)'. List commands with menu_commands to see what exists.", code: "command_not_found")
+	}
+
+	/// Presses a menu item through Accessibility; works with the app in the background.
+	func menuPress(pid: Int32, path: String) throws -> [String: Any] {
+		let entry = try resolveMenuEntry(pid: pid, path: path)
+		var status = AXUIElementPerformAction(entry.element, kAXPressAction as CFString)
+		if status == .cannotComplete {
+			usleep(80_000)
+			status = AXUIElementPerformAction(entry.element, kAXPressAction as CFString)
+		}
+		guard status == .success else {
+			throw BridgeFailure(message: "Menu command '\(entry.path.joined(separator: " > "))' could not be pressed (AX error \(status.rawValue))\(entry.enabled ? "" : "; it is disabled")", code: "action_failed")
+		}
+		return ["path": entry.path.joined(separator: " > "), "enabled": entry.enabled]
+	}
+
+	/// Command shortcuts only reach the front app, so in the background they are
+	/// run through the menu item that owns them, when one exists.
+	func pressMenuShortcut(pid: Int32, keys: [String]) -> String? {
+		let parts = keys.count == 1 ? keys[0].split(separator: "+").map { String($0).lowercased().trimmingCharacters(in: .whitespaces) } : keys.map { $0.lowercased() }
+		let modifierNames: Set<String> = ["cmd", "command", "meta", "super", "shift", "alt", "option", "opt", "ctrl", "control"]
+		guard let key = parts.last, !modifierNames.contains(key), parts.contains(where: { ["cmd", "command", "meta", "super"].contains($0) }) else { return nil }
+		var wanted = ["cmd"]
+		if parts.contains(where: { ["ctrl", "control"].contains($0) }) { wanted.insert("ctrl", at: 0) }
+		if parts.contains(where: { ["alt", "option", "opt"].contains($0) }) { wanted.insert("alt", at: wanted.count - 1) }
+		if parts.contains("shift") { wanted.insert("shift", at: wanted.count - 1) }
+		let target = (wanted + [key]).joined(separator: "+")
+		guard let entry = menuEntries(pid: pid).first(where: { $0.enabled && !$0.hasSubmenu && $0.shortcut == target }) else { return nil }
+		return AXUIElementPerformAction(entry.element, kAXPressAction as CFString) == .success ? entry.path.joined(separator: " > ") : nil
+	}
+
+	/// Draws labelled boxes on a JPEG (image-pixel coordinates) and returns a JPEG.
+	func annotateImage(_ request: [String: Any]) throws -> [String: Any] {
+		guard let base64 = request["jpegBase64"] as? String, let data = Data(base64Encoded: base64),
+			let source = CGImageSourceCreateWithData(data as CFData, nil), let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
+		else { throw BridgeFailure(message: "annotateImage requires a JPEG in jpegBase64", code: "invalid_args") }
+		let boxes = request["boxes"] as? [[String: Any]] ?? []
+		let width = image.width, height = image.height
+		guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+			throw BridgeFailure(message: "Could not create an annotation context", code: "capture_failed")
+		}
+		context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+		// Flip to image coordinates (origin top-left) for the boxes and labels.
+		context.translateBy(x: 0, y: CGFloat(height))
+		context.scaleBy(x: 1, y: -1)
+		let scale = max(1, CGFloat(min(width, height)) / 700)
+		let font = NSFont.boldSystemFont(ofSize: 11 * scale)
+		NSGraphicsContext.saveGraphicsState()
+		NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+		for box in boxes {
+			guard let x = (box["x"] as? NSNumber)?.doubleValue, let y = (box["y"] as? NSNumber)?.doubleValue,
+				let w = (box["w"] as? NSNumber)?.doubleValue, let h = (box["h"] as? NSNumber)?.doubleValue
+			else { continue }
+			let rect = CGRect(x: x, y: y, width: w, height: h)
+			context.setStrokeColor(NSColor.systemPink.withAlphaComponent(0.9).cgColor)
+			context.setLineWidth(1.5 * scale)
+			context.stroke(rect)
+			let label = (box["label"] as? String ?? "") as NSString
+			let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
+			let size = label.size(withAttributes: attributes)
+			let tag = CGRect(x: rect.minX, y: max(0, rect.minY - size.height - 2), width: size.width + 6, height: size.height + 2)
+			context.setFillColor(NSColor.systemPink.withAlphaComponent(0.9).cgColor)
+			context.fill(tag)
+			label.draw(at: CGPoint(x: tag.minX + 3, y: tag.minY + 1), withAttributes: attributes)
+		}
+		NSGraphicsContext.restoreGraphicsState()
+		guard let annotated = context.makeImage() else { throw BridgeFailure(message: "Could not render the annotated image", code: "capture_failed") }
+		let output = NSMutableData()
+		guard let destination = CGImageDestinationCreateWithData(output, "public.jpeg" as CFString, 1, nil) else {
+			throw BridgeFailure(message: "Could not encode the annotated image", code: "capture_failed")
+		}
+		CGImageDestinationAddImage(destination, annotated, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
+		guard CGImageDestinationFinalize(destination) else { throw BridgeFailure(message: "Could not encode the annotated image", code: "capture_failed") }
+		return ["jpegBase64": (output as Data).base64EncodedString(), "width": width, "height": height]
+	}
 }
 
 @main

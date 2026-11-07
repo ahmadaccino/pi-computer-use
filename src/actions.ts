@@ -26,7 +26,8 @@ export type PreparedAction =
 	| { action: "scroll"; target: ActionTarget; params: { scrollX: number; scrollY: number }; establishesFocus: false; usesCurrentFocus: false; needsForeground: false }
 	| { action: "drag"; target: ActionTarget; params: PreparedDragParams; establishesFocus: false; usesCurrentFocus: false; needsForeground: boolean }
 	| { action: "moveMouse"; target: ActionTarget; params: Record<string, never>; establishesFocus: false; usesCurrentFocus: false; needsForeground: false }
-	| { action: "wait"; params: { ms: number }; establishesFocus: false; usesCurrentFocus: false; needsForeground: false };
+	| { action: "wait"; params: { ms: number }; establishesFocus: false; usesCurrentFocus: false; needsForeground: false }
+	| { action: "menu"; params: { command: string }; establishesFocus: false; usesCurrentFocus: false; needsForeground: false };
 
 export interface ActionState {
 	currentFocus: boolean;
@@ -46,6 +47,12 @@ export interface ActionEnvironment {
 	supportsScreenPoints?: boolean;
 	/** Whether native input accepts a `{ window: true }` keyboard target (keys to the root's focused control). */
 	supportsWindowKeyboard?: boolean;
+	/** Whether unreferenced keyboard input can be delivered to the window in the background (macOS SkyLight). */
+	supportsBackgroundInput?: boolean;
+	/** Whether coordinate clicks can be delivered in the background (macOS SkyLight, opt-in). */
+	supportsBackgroundPointer?: boolean;
+	/** Whether menu-bar commands can be pressed by path. */
+	supportsMenuCommands?: boolean;
 }
 
 export interface TextResolution {
@@ -201,6 +208,13 @@ export function prepareAction(action: UiAction, state: ActionState, env: ActionE
 	if (operation === "wait") {
 		return { action: "wait", params: { ms: boundedMs(action.ms, 0, MAX_WAIT_ACTION_MS) }, establishesFocus: false, usesCurrentFocus: false, needsForeground: false };
 	}
+	if (operation === "menu") {
+		const command = action.command?.trim();
+		if (!command) throw new Error('menu requires command, e.g. "File > New Folder".');
+		if (!env.supportsMenuCommands) throw new Error("menu commands are not supported on this platform.");
+		return { action: "menu", params: { command }, establishesFocus: false, usesCurrentFocus: false, needsForeground: false };
+	}
+	if (operation === "choosePath") throw new Error("choosePath must be expanded before preparation.");
 	if (operation === "drag") {
 		const params = dragParams(action, env, localStateId);
 		const { lookId: _lookId, pid: _pid, ...source } = params.path[0];
@@ -214,17 +228,41 @@ export function prepareAction(action: UiAction, state: ActionState, env: ActionE
 	const target: ActionTarget = usesCurrentFocus ? focusedTarget(env) : toWindow ? { window: true } : nativeTarget(action, operation, env);
 	const focusNode = action.ref ? env.node(action.ref) : undefined;
 	const establishesFocus = !env.headless && Boolean(focusNode) && (operation === "click" || operation === "press") && containsEditable(focusNode!);
-	const needsForeground = !env.headless && (operation === "click" || operation === "press") && "x" in target;
+	const needsForeground = !env.headless && !env.supportsBackgroundPointer && (operation === "click" || operation === "press") && "x" in target;
 
 	switch (operation) {
 		case "press":
 		case "click": return { action: operation, target, params: { button: mouseButton(action.button), clickCount: clickCount(action.clickCount) }, establishesFocus, usesCurrentFocus: false, needsForeground };
 		case "setText": return { action: operation, target, params: { text: action.text ?? "" }, establishesFocus: false, usesCurrentFocus: false, needsForeground: false };
-		case "typeText": return { action: operation, target, params: { text: action.text ?? "" }, establishesFocus: false, usesCurrentFocus, needsForeground: toWindow };
-		case "keypress": return { action: operation, target, params: { keys: keys(action.keys) }, establishesFocus: false, usesCurrentFocus, needsForeground: toWindow };
+		case "typeText": return { action: operation, target, params: { text: action.text ?? "" }, establishesFocus: false, usesCurrentFocus, needsForeground: toWindow && !env.supportsBackgroundInput };
+		case "keypress": return { action: operation, target, params: { keys: keys(action.keys) }, establishesFocus: false, usesCurrentFocus, needsForeground: toWindow && !env.supportsBackgroundInput };
 		case "scroll": return { action: operation, target, params: { scrollX: scrollDelta(action.scrollX), scrollY: scrollDelta(action.scrollY) }, establishesFocus: false, usesCurrentFocus: false, needsForeground: false };
 		case "moveMouse": return { action: operation, target, params: {}, establishesFocus: false, usesCurrentFocus: false, needsForeground: false };
 	}
+}
+
+/**
+ * Expands `choosePath` into the Open/Save panel recipe: Go to Folder
+ * (Cmd+Shift+G), replace its field, Return; optionally Return again to confirm.
+ * Everything stays in one transaction, so later steps act on the panel as it is.
+ */
+export function expandMacroActions(actions: UiAction[]): UiAction[] {
+	return actions.flatMap((action): UiAction[] => {
+		if (action.action !== "choosePath") return [action];
+		const location = action.location?.trim();
+		if (!location) throw new Error("choosePath requires location (a folder or file path).");
+		const steps: UiAction[] = [
+			{ action: "keypress", keys: ["cmd+shift+g"] },
+			{ action: "wait", ms: 500 },
+			{ action: "keypress", keys: ["cmd+a"] },
+			{ action: "typeText", text: location },
+			{ action: "wait", ms: 200 },
+			{ action: "keypress", keys: ["return"] },
+			{ action: "wait", ms: 500 },
+		];
+		if (action.confirm) steps.push({ action: "keypress", keys: ["return"] }, { action: "wait", ms: 400 });
+		return steps;
+	});
 }
 
 export function canRetryInForeground(action: PreparedAction, outcome: "worked" | "didnt" | "unknown", headless: boolean): boolean {

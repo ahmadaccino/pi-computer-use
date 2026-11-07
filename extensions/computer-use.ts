@@ -7,6 +7,8 @@ import {
 	executeExpandUi,
 	executeInspectUi,
 	executeLaunchBrowser,
+	executeAppControl,
+	executeMenuCommands,
 	executeFind,
 	executeNavigateBrowser,
 	executeObserve,
@@ -57,6 +59,12 @@ const uiAction = Type.Union([
 	Type.Object({ action: Type.Literal("moveMouse"), ...point, space }),
 	Type.Object({ action: Type.Literal("moveMouse"), text: visibleText }),
 	Type.Object({ action: Type.Literal("wait"), ms: Type.Number({ minimum: 0, maximum: 10000, description: "Pause inside the transaction, e.g. for a menu or loading state" }) }),
+	Type.Object({ action: Type.Literal("menu"), command: Type.String({ description: 'Menu-bar command path from menu_commands, e.g. "File > New Folder"; works with the app in the background', minLength: 1 }) }),
+	Type.Object({
+		action: Type.Literal("choosePath"),
+		location: Type.String({ description: "Folder or file path for an open Open/Save panel (uses Go to Folder)", minLength: 1 }),
+		confirm: Type.Optional(Type.Boolean({ description: "Press Return again to confirm the panel" })),
+	}),
 ]);
 const successorObserve = Type.Optional(Type.Union([Type.Literal("semantic"), Type.Literal("visual"), Type.Literal("fused")], { description: "Successor observation; visual attaches the new screenshot so no follow-up observe_ui is needed" }));
 
@@ -101,6 +109,7 @@ const observeTool = defineTool({
 		root: Type.Optional(Type.String({ description: "Exact @r ref issued by find_roots" })),
 		mode: Type.Optional(Type.Union([Type.Literal("semantic"), Type.Literal("visual"), Type.Literal("fused")], { description: "Observation mode, default fused" })),
 		detail: Type.Optional(Type.Union([Type.Literal("compact"), Type.Literal("outline")], { description: "compact (default) lists actionable refs; outline returns the folded tree" })),
+		annotate: Type.Optional(Type.Boolean({ description: "Draw each listed control's box and @e ref onto the screenshot (implies an image)" })),
 	}),
 	execute: executeObserve,
 });
@@ -199,7 +208,42 @@ const evaluateBrowserTool = defineTool({
 	execute: executeEvaluateBrowser,
 });
 
-const COMPUTER_USE_TOOLS = [findTool, observeTool, searchUiTool, expandUiTool, inspectUiTool, actTool, readTextTool, waitForTool, launchBrowserTool, navigateBrowserTool, evaluateBrowserTool];
+const appTarget = {
+	stateId: Type.Optional(Type.String({ description: "State whose app is the target" })),
+	root: Type.Optional(Type.String({ description: "Exact @r root ref; its app is the target" })),
+	app: Type.Optional(Type.String({ description: "App name", maxLength: 256 })),
+	bundleId: Type.Optional(Type.String({ description: "Bundle id" })),
+};
+
+const menuCommandsTool = defineTool({
+	name: "menu_commands",
+	label: "Menu Commands",
+	description: "List an app's menu-bar commands (path, shortcut, enabled, checked) without opening any menu. Defaults to the frontmost app.",
+	promptSnippet: "Find a menu command, then run it with act_ui {action:\"menu\", command}; often one step instead of a click-through.",
+	parameters: Type.Object({
+		...appTarget,
+		query: Type.Optional(Type.String({ description: "Words that must all appear in the path or shortcut", maxLength: 256 })),
+		limit: Type.Optional(Type.Number({ minimum: 1, maximum: 400, description: "Default 80" })),
+	}),
+	execute: executeMenuCommands,
+});
+
+const appControlTool = defineTool({
+	name: "app_control",
+	label: "App Control",
+	description: "Launch, quit, relaunch (with command-line args), activate, or hide an app; launch/relaunch waits for its window and returns its roots.",
+	promptSnippet: "Manage app lifecycle instead of shelling out; relaunch Electron/CEF apps with --force-renderer-accessibility when observe_ui suggests it.",
+	promptGuidelines: ["Quit and relaunch close the app's windows; save or confirm with the user first."],
+	parameters: Type.Object({
+		...appTarget,
+		action: Type.Union([Type.Literal("launch"), Type.Literal("quit"), Type.Literal("relaunch"), Type.Literal("activate"), Type.Literal("hide")]),
+		args: Type.Optional(Type.Array(Type.String(), { maxItems: 16, description: "Command-line arguments for launch/relaunch" })),
+		waitMs: Type.Optional(Type.Number({ minimum: 0, maximum: 60000, description: "Wait for a window after launch, default 20000" })),
+	}),
+	execute: executeAppControl,
+});
+
+const COMPUTER_USE_TOOLS = [findTool, observeTool, searchUiTool, expandUiTool, inspectUiTool, actTool, readTextTool, waitForTool, launchBrowserTool, navigateBrowserTool, evaluateBrowserTool, menuCommandsTool, appControlTool];
 const COMPUTER_USE_TOOL_NAMES = new Set(COMPUTER_USE_TOOLS.map((tool) => tool.name));
 
 function formatConfigStatus(): string {
@@ -211,6 +255,8 @@ function formatConfigStatus(): string {
 		`headless: ${loaded.config.headless ? "enabled" : "disabled"}`,
 		`cursor_overlay: ${loaded.config.cursor_overlay ? "enabled" : "disabled"}`,
 		`activity_glow: ${loaded.config.activity_glow ? "enabled" : "disabled"}`,
+		`background_input: ${loaded.config.background_input ? "enabled" : "disabled"}`,
+		`background_pointer: ${loaded.config.background_pointer ? "enabled (experimental)" : "disabled"}`,
 		"",
 		"Sources:",
 		...loaded.sources.map((source) => `- ${source.path}: ${source.error ? `error: ${source.error}` : source.exists ? "loaded" : "not found"}`),

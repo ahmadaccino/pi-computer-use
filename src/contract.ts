@@ -41,6 +41,8 @@ export interface EvaluateBrowserParams {
 export interface ObserveParams extends ObserveTargetParams {
 	mode?: "semantic" | "visual" | "fused";
 	detail?: ObserveDetail;
+	/** Draw each listed control's box and @e ref onto the screenshot (forces an image). */
+	annotate?: boolean;
 	/** Internal capture override; not part of the model-facing schema. */
 	readText?: "auto" | "always" | "never";
 }
@@ -90,7 +92,7 @@ export interface DragEndpoint {
 }
 
 export interface UiAction {
-	action: "press" | "click" | "setText" | "typeText" | "keypress" | "scroll" | "drag" | "moveMouse" | "wait";
+	action: "press" | "click" | "setText" | "typeText" | "keypress" | "scroll" | "drag" | "moveMouse" | "wait" | "menu" | "choosePath";
 	ref?: string;
 	x?: number;
 	y?: number;
@@ -109,6 +111,12 @@ export interface UiAction {
 	dwellMs?: number;
 	/** wait: milliseconds to pause inside the transaction. */
 	ms?: number;
+	/** menu: menu-bar command path such as "File > Import…" (a unique leaf title also works). */
+	command?: string;
+	/** choosePath: absolute or ~ path to navigate an Open/Save panel to (via Go to Folder). */
+	location?: string;
+	/** choosePath: press Return again afterwards to confirm the panel (Open/Save). */
+	confirm?: boolean;
 	button?: MouseButtonName;
 	clickCount?: number;
 }
@@ -127,6 +135,29 @@ export interface ReadTextParams extends StateTargetParams {
 	offset?: number;
 }
 
+export interface AppTargetParams {
+	/** State whose app is the target. */
+	stateId?: string;
+	/** Exact @r root ref; its app is the target. */
+	root?: string;
+	app?: string;
+	bundleId?: string;
+}
+
+export interface MenuCommandsParams extends AppTargetParams {
+	/** Words that must all appear in the command path or shortcut. */
+	query?: string;
+	limit?: number;
+}
+
+export interface AppControlParams extends AppTargetParams {
+	action: "launch" | "quit" | "relaunch" | "activate" | "hide";
+	/** Command-line arguments for launch/relaunch, e.g. ["--force-renderer-accessibility"]. */
+	args?: string[];
+	/** For launch/relaunch: how long to wait for a window (default 20000). */
+	waitMs?: number;
+}
+
 export interface WaitForParams extends StateTargetParams, UiCondition {
 	observe?: SuccessorObserveMode;
 }
@@ -143,4 +174,6 @@ export const AGENT_TOOL_NAMES = new Set([
 	"navigate_browser",
 	"evaluate_browser",
 	"launch_browser",
+	"menu_commands",
+	"app_control",
 ]);
